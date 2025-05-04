@@ -52,33 +52,6 @@ You may validate your API key using the following command:
 dotenvx run -- env | grep ^WAF
 ```
 
-### Test certificate
-
-> **<span style="color:red;">SELF-SIGNED CERTIFICATES ARE NOT WORKING WITH WAFaaS.</span>** Documentation will be updated soon to reflect this limitation.
-
-Optional: lets create self signed wildcard certificates for the demo.
-
-```shell
-# create new CA
-openssl genrsa -out ca.key 2048
-openssl req -x509 -new -nodes -key ca.key -sha256 -days 1024 -out ca.crt -subj "/C=US/ST=CA/L=San Francisco/O=My Company/CN=ca.example.com"
-
-# create a new server key and issue a certificate
-openssl genrsa -out server.key 2048
-openssl req -new -key server.key -out server.csr -subj "/C=US/ST=CA/L=San Francisco/O=My Company/CN=*.example.com" -addext "subjectAltName = DNS:*.example.com"
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 500 --extfile <(echo "subjectAltName = DNS:*.example.com" )
-
-# check what we have got
-openssl x509 -in server.crt -text -noout | grep CN
-openssl x509 -in server.crt -text -noout | grep DNS
-# check CA cert too
-openssl x509 -in ca.crt -text -noout | grep CN
-
-# summary:
-ls -la ca.*
-ls -la server.*
-```
-
 ### Create or review WAFaaS Profile
 
 Visit WAFaaS asset in UI and note asset name and region.
@@ -106,25 +79,24 @@ config:
   region: "eu-north-1"
 
 assets:
-  - name: "httpbin.example.com" # asset name
-    domain: "httpbin.example.com" # front end url without https:// prefix
-    host: "httpbin.org" # host header sent to upstream
-    upstream: "https://httpbin.org"
+  - name: "example.com" # asset name
+    domain: "https://example1.com,https://example2.com,https://example3.com" # each url from the asset comma separated
+    owncertificate: false # could be true or false if false, you have to provide the path of the certificate (full chain) and the key in pem format
+    host: "example.org" # host header sent to upstream
+    upstream: "https://example.org"
     cert_pem: "server.crt" # certificate file location
     cert_key: "server.key" # key file location
 
   - name: "ifconfig.example.com" # asset name
-    domain: "ifconfig.example.com" # front end url without https:// prefix
+    domain: "ifconfig.example.com" # each url from the asset comma separated
+    owncertificate: true # if true, the certificate is an AWS hosted certificate
     host: "ifconfig.me" # host header sent to upstream
     upstream: "https://ifconfig.me"
-    cert_pem: "server.crt" # certificate file location
-    cert_key: "server.key" # key file location
 ```
 
 ### Execute asset provisioning
 
 Script checks if asserts already exist and if not, creates them. It also uploads custom certificates as provided in files. 
-It gives summary of service DNS recorts - CNAMEs to WAF service.
 
 ```shell
 # check assets to create
@@ -141,36 +113,11 @@ Uploaded certificates are used for the assets and can be confirmed in the UI und
 
 ![alt text](img/domain-cert-uploaded.png)
 
-
-### Validate services created
-
-Assume that Profile instructions said for `west2.wafaas.klaud.online` to create CNAME record `west2.wafaas.klaud.online` pointing to `west2wafaasklaudonline.5c4121f6-2e3a-4672-b593-d94e06c65c73.3f10f27ca6ff.i2.checkpoint.com`.
-
-```shell
-# need dig cli tool:
-sudo apt update; sudo apt install dnsutils -y
-# resolve one of frontend IPs for WAF service
-dig +short west2wafaasklaudonline.5c4121f6-2e3a-4672-b593-d94e06c65c73.3f10f27ca6ff.i2.checkpoint.com. A | tail -1
-# save IP for later
-WAFIP=$(dig +short west2wafaasklaudonline.5c4121f6-2e3a-4672-b593-d94e06c65c73.3f10f27ca6ff.i2.checkpoint.com. A | tail -1)
-
-# tell curl to go via WAF service
-curl https://west2.wafaas.klaud.online/ --resolve west2.wafaas.klaud.online:443:$WAFIP
-
-# and WAF incident
-curl 'https://west2.wafaas.klaud.online/?q=UNION+13=13--' --resolve west2.wafaas.klaud.online:443:$WAFIP
-# check logs as we are in Detect/Learn mode
-
-```
-
-Note: script gives summary of WAF service CNAME similar to:
+Execution
 
 ```shell
 # execute deployment - all is done, so we check only state of Deployment
 dotenvx run -- deno run -A deploy-waf-with-own-cert.ts
-
-# expected DNS records:
-# ./cfdns.ts create -n west2.wafaas.klaud.online. -c west2wafaasklaudonline.5c4121f6-2e3a-4672-b593-d94e06c65c73.3f10f27ca6ff.i2.checkpoint.com. -t CNAME
 ```
 
 ### Troubleshooting
