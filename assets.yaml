@@ -1,0 +1,20 @@
+
+configuration:
+  profile: "test profile"
+  region: "eu-west-1"
+
+assets:
+  - name: "test1"
+    domain: "https://example1.es, https://example11.es, https://example111.com"
+    owncertificate: true
+    host: "httpbin.org"
+    upstream: "https://httpbin.org"
+    cert_pem: "_.wafaas.crt"
+    cert_key: "_.wafaas.key"
+  
+  - name: "test2"
+    domain: "https://example2.es, https://example22.es"
+    owncertificate: false
+    host: "httpbin.org"
+    upstream: "https://httpbin.org"
+
