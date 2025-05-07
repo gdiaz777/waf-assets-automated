@@ -79,3 +79,17 @@ assets:
     domain: "https://another.com"
     upstream: "https://upstream.another.com"
     owncertificate: false
+
+```
+## Fields:
+    profile: The WAF profile name.
+    region: The region where the assets will be deployed.
+    assets: A list of assets to be deployed.
+        name: The name of the asset.
+        domain: A comma-separated list of domains for the asset.
+        upstream: The upstream URL for the asset.
+        owncertificate: Whether the asset uses its own certificate (true) or an AWS-managed certificate (false).
+        cert_pem: Path to the PEM file for the certificate (required if owncertificate is true).
+        cert_key: Path to the key file for the certificate (required if owncertificate is true).
+
+```yaml
