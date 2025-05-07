@@ -17,46 +17,73 @@ This repository contains two main scripts, `upload-certificate-checkpoint-wafsaa
 
 ---
 
-## Scripts Overview
+# Scripts Overview
 
-### upload-certificate-checkpoint-wafsaas.ts
-This script is responsible for uploading certificates to Check Point WAF SaaS. It reads the `certificates.yaml` file to get the list of certificates and their associated domains, then uploads them to the WAF.
+## Purpose
 
-#### Key Features:
-- Reads certificate details (PEM and key files) from `certificates.yaml`.
-- Uploads certificates to Check Point WAF SaaS.
-- Handles errors and logs the results.
-
-#### Workflow:
-1. Load the `certificates.yaml` file.
-2. Authenticate with the WAF SaaS API.
-3. Iterate through the list of certificates and upload them.
-4. Log the results to a timestamped log file.
+The purpose of `deploy-assets-checkpoint-wafsaas.ts` is to:
+- Automate the deployment of assets to the WAF SaaS platform.
+- Ensure assets are configured with the correct upstream URLs and certificates.
+- Publish and enforce changes after deployment.
 
 ---
 
-### deploy-assets-checkpoint-wafsaas.ts
-This script automates the deployment of assets to Check Point WAF SaaS. It reads the `assets.yaml` file to get the list of assets and their configurations, then creates or updates the assets in the WAF.
+## Key Features
 
-#### Key Features:
-- Reads asset configurations from `assets.yaml`.
-- Creates or updates assets in Check Point WAF SaaS.
-- Publishes and enforces changes.
-- Handles errors and logs the results.
+1. **Asset Deployment**:
+   - Automatically creates assets based on the configuration provided in `assets.yaml`.
+   - Skips assets that already exist to avoid duplication.
 
-#### Workflow:
-1. Load the `assets.yaml` file.
-2. Authenticate with the WAF SaaS API.
-3. Fetch the WAF profile ID.
-4. Iterate through the list of assets:
-   - Check if the asset already exists.
-   - If it exists, skip it.
-   - If it doesn't exist, create it.
-5. Publish and enforce changes.
-6. Log the results to a timestamped log file.
+2. **Certificate Management**:
+   - Supports assets with custom certificates (`owncertificate: true`).
+   - Integrates with AWS for automatic certificate creation if needed.
+
+3. **Change Management**:
+   - Publishes and enforces changes after asset creation to ensure the configuration is applied.
+
+4. **Logging**:
+   - Generates detailed logs for each operation, including success and failure messages.
 
 ---
 
+## How It Works
+
+1. **Configuration Loading**:
+   - The script reads the asset configuration from `assets.yaml`, which defines the assets to be deployed.
+
+2. **WAF SaaS Login**:
+   - Logs in to the WAF SaaS platform using credentials provided in environment variables.
+
+3. **Profile and Region Setup**:
+   - Fetches the WAF profile and region specified in the configuration.
+
+4. **Asset Deployment**:
+   - Iterates through the assets defined in `assets.yaml`.
+   - Checks if the asset already exists:
+     - If it exists, skips deployment.
+     - If it does not exist, creates the asset with the specified configuration.
+
+5. **Change Publishing and Enforcement**:
+   - Publishes and enforces changes after deploying assets to ensure the configuration is applied.
+
+6. **Logging**:
+   - Logs the results of each operation to a timestamped log file.
+
+---
+
+## How to Run the Script
+
+``` yaml
+dotenvx run -- deno run -A deploy-assets-checkpoint-wafsaas.ts
+```
+---
+## Logs
+The script generates a log file in the current directory with the format <timestamp>_deploy-assets_output.log. This log file contains detailed information about the operations performed, including success and failure messages.
+
+## Notes
+- Ensure the assets.yaml file is correctly formatted to avoid parsing errors.
+- Use the log file to debug any issues during deployment.
+- If an asset fails to deploy, the script will log the error and continue with the next asset.
 ## Configuration Files
 
 ### assets.yaml
@@ -83,15 +110,15 @@ assets:
 ```
 ### Fields:
 
-profile: The WAF profile name.
-region: The region where the assets will be deployed.
-assets: A list of assets to be deployed.
-    name: The name of the asset.
-    domain: A comma-separated list of domains for the asset.
-    upstream: The upstream URL for the asset.
-    owncertificate: Whether the asset uses its own certificate (true) or an AWS-managed certificate (false).
-    cert_pem: Path to the PEM file for the certificate (required if owncertificate is true).
-    cert_key: Path to the key file for the certificate (required if owncertificate is true).
+- profile: The WAF profile name.
+- region: The region where the assets will be deployed.
+- assets: A list of assets to be deployed.
+    - name: The name of the asset.
+    - domain: A comma-separated list of domains for the asset.
+    - upstream: The upstream URL for the asset.
+    - owncertificate: Whether the asset uses its own certificate (true) or an AWS-managed certificate (false).
+    - cert_pem: Path to the PEM file for the certificate (required if owncertificate is true).
+    - cert_key: Path to the key file for the certificate (required if owncertificate is true).
 
 ### certificates.yaml
 This file contains the configuration for certificates to be uploaded to Check Point WAF SaaS.
@@ -110,9 +137,12 @@ This file contains the configuration for certificates to be uploaded to Check Po
         cert_key: "/path/to/example2_key.pem"
 ```
 ### Fields:
-profile: The WAF profile name.
-region: The region where the assets will be deployed.
-urls: A list of certificates to be uploaded.
-url: The domain associated with the certificate.
-cert_pem: Path to the PEM file for the certificate.
-cert_key: Path to the key file for the certificate.
+
+- profile: The WAF profile name.
+- region: The region where the assets will be deployed.
+- urls: A list of certificates to be uploaded.
+    - url: The domain associated with the certificate.
+    - cert_pem: Path to the PEM file for the certificate.
+    - cert_key: Path to the key file for the certificate.
+
+
