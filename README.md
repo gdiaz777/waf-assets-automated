@@ -82,15 +82,13 @@ assets:
   - name: "example.com" # asset name
     domain: "https://example1.com,https://example2.com,https://example3.com" # each url from the asset comma separated
     owncertificate: false # could be true or false if false, you have to provide the path of the certificate (full chain) and the key in pem format
-    host: "example.org" # host header sent to upstream
     upstream: "https://example.org"
     cert_pem: "server.crt" # certificate file location
     cert_key: "server.key" # key file location
 
   - name: "ifconfig.example.com" # asset name
-    domain: "ifconfig.example.com" # each url from the asset comma separated
+    domain: "https://ifconfig.example.com" # each url from the asset comma separated
     owncertificate: true # if true, the certificate is an AWS hosted certificate
-    host: "ifconfig.me" # host header sent to upstream
     upstream: "https://ifconfig.me"
 ```
 
