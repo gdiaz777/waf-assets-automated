@@ -81,15 +81,38 @@ assets:
     owncertificate: false
 
 ```
-## Fields:
-    profile: The WAF profile name.
-    region: The region where the assets will be deployed.
-    assets: A list of assets to be deployed.
-        name: The name of the asset.
-        domain: A comma-separated list of domains for the asset.
-        upstream: The upstream URL for the asset.
-        owncertificate: Whether the asset uses its own certificate (true) or an AWS-managed certificate (false).
-        cert_pem: Path to the PEM file for the certificate (required if owncertificate is true).
-        cert_key: Path to the key file for the certificate (required if owncertificate is true).
+### Fields:
 
+profile: The WAF profile name.
+region: The region where the assets will be deployed.
+assets: A list of assets to be deployed.
+    name: The name of the asset.
+    domain: A comma-separated list of domains for the asset.
+    upstream: The upstream URL for the asset.
+    owncertificate: Whether the asset uses its own certificate (true) or an AWS-managed certificate (false).
+    cert_pem: Path to the PEM file for the certificate (required if owncertificate is true).
+    cert_key: Path to the key file for the certificate (required if owncertificate is true).
+
+### certificates.yaml
+This file contains the configuration for certificates to be uploaded to Check Point WAF SaaS.
+
+#### Example Structure:
 ```yaml
+    configuration:
+      profile: "WAF SaaS Test2"
+      region: "eu-west-1"
+    urls:
+      - url: "https://example.com"
+        cert_pem: "/path/to/example_cert.pem"
+        cert_key: "/path/to/example_key.pem"
+      - url: "https://example2.com"
+        cert_pem: "/path/to/example2_cert.pem"
+        cert_key: "/path/to/example2_key.pem"
+```
+### Fields:
+profile: The WAF profile name.
+region: The region where the assets will be deployed.
+urls: A list of certificates to be uploaded.
+url: The domain associated with the certificate.
+cert_pem: Path to the PEM file for the certificate.
+cert_key: Path to the key file for the certificate.
