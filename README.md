@@ -1,123 +1,81 @@
-# Declarative creation or WAFaaS assets
+# Check Point WAF SaaS Automation Scripts
 
-This scenario was validated in Github Codespace. Consider opening repo in Codespace and running the instructions there (or in local devcontainer).
+This repository contains two main scripts, `upload-certificate-checkpoint-wafsaas.ts` and `deploy-assets-checkpoint-wafsaas.ts`, along with configuration files `assets.yaml` and `certificates.yaml`. These scripts automate the deployment of assets and the management of certificates for Check Point WAF SaaS.
 
+---
 
-### ⚠️ Important Notes
+## Table of Contents
+1. [Scripts Overview](#scripts-overview)
+    - [upload-certificate-checkpoint-wafsaas.ts](#upload-certificate-checkpoint-wafsaasts)
+    - [deploy-assets-checkpoint-wafsaas.ts](#deploy-assets-checkpoint-wafsaasts)
+2. [Configuration Files](#configuration-files)
+    - [assets.yaml](#assetsyaml)
+    - [certificates.yaml](#certificatesyaml)
+3. [How to Use](#how-to-use)
+4. [Prerequisites](#prerequisites)
+5. [Logging](#logging)
 
-> **NOTE:** This is a PoC/concept and not production-ready code. It has not been tested for all edge cases and should be used with caution.
+---
 
-> **<span style="color:red;">SELF-SIGNED CERTIFICATES ARE NOT WORKING WITH WAFaaS.</span>** Documentation will be updated soon to reflect this limitation.
+## Scripts Overview
 
-### Dependencies
+### upload-certificate-checkpoint-wafsaas.ts
+This script is responsible for uploading certificates to Check Point WAF SaaS. It reads the `certificates.yaml` file to get the list of certificates and their associated domains, then uploads them to the WAF.
 
-```shell
-# install Deno - https://docs.deno.com/runtime/getting_started/installation/
-curl -fsSL https://deno.land/install.sh | sh
+#### Key Features:
+- Reads certificate details (PEM and key files) from `certificates.yaml`.
+- Uploads certificates to Check Point WAF SaaS.
+- Handles errors and logs the results.
 
-# install dotenvx - https://dotenvx.com/
-curl -fsS https://dotenvx.sh | sudo sh
+#### Workflow:
+1. Load the `certificates.yaml` file.
+2. Authenticate with the WAF SaaS API.
+3. Iterate through the list of certificates and upload them.
+4. Log the results to a timestamped log file.
 
-# open terminal again with new environment
-exit
+---
 
-# check versions
-deno --version
-dotenvx --version
-```
+### deploy-assets-checkpoint-wafsaas.ts
+This script automates the deployment of assets to Check Point WAF SaaS. It reads the `assets.yaml` file to get the list of assets and their configurations, then creates or updates the assets in the WAF.
 
-### WAF API key
+#### Key Features:
+- Reads asset configurations from `assets.yaml`.
+- Creates or updates assets in Check Point WAF SaaS.
+- Publishes and enforces changes.
+- Handles errors and logs the results.
 
-Login to your CloudGuard WAF tenant and setup new admin keys for CloudGuard WAF:
-https://portal.checkpoint.com/dashboard/settings/api-keys
+#### Workflow:
+1. Load the `assets.yaml` file.
+2. Authenticate with the WAF SaaS API.
+3. Fetch the WAF profile ID.
+4. Iterate through the list of assets:
+   - Check if the asset already exists.
+   - If it exists, skip it.
+   - If it doesn't exist, create it.
+5. Publish and enforce changes.
+6. Log the results to a timestamped log file.
 
-![alt text](img/api-keys.png)
+---
 
-Create new `.env` file in the root of the project and add the following variables:
+## Configuration Files
 
-```env
-# .env
-# WAF API key
-WAFKEY=xxx
-# WAF API secret
-WAFSECRET=yyy
-# AUTH URL
-WAFAUTHURL=https://cloudinfra-gw.portal.checkpoint.com/auth/external
-```
+### assets.yaml
+This file contains the configuration for assets to be deployed to Check Point WAF SaaS.
 
-You may validate your API key using the following command:
-
-```shell
-# validate WAF API key
-dotenvx run -- env | grep ^WAF
-```
-
-### Create or review WAFaaS Profile
-
-Visit WAFaaS asset in UI and note asset name and region.
-
-https://portal.checkpoint.com/dashboard/appsec/cloudguardwaf#/waf-policy/profiles/ 
-
-For example, the profile type is `CloudGuard WAF SaaS Profile` name is `saas-stockholm` and the region for Stockholm is `eu-north-1`.
-
-| **Location** | **AWS Region Name** |
-|--------------|---------------------|
-| Stockholm    | eu-north-1          |
-| Milan        | eu-south-1          |
-| Ireland      |               |
-
-![alt text](./img/wafaas-profile.png)
-
-
-### Review assets.yaml definiton
-
-`assets.yaml` file contains the WAFaaS asset definition. Here is typical template based on inputs we know:
-
+#### Example Structure:
 ```yaml
-config:
-  profile: "saas-stockholm"
-  region: "eu-north-1"
+configuration:
+  profile: "example-profile"
+  region: "eu-west-1"
 
 assets:
-  - name: "example.com" # asset name
-    domain: "https://example1.com,https://example2.com,https://example3.com" # each url from the asset comma separated
-    owncertificate: false # could be true or false if false, you have to provide the path of the certificate (full chain) and the key in pem format
-    upstream: "https://example.org"
-    cert_pem: "server.crt" # certificate file location
-    cert_key: "server.key" # key file location
-
-  - name: "ifconfig.example.com" # asset name
-    domain: "https://ifconfig.example.com" # each url from the asset comma separated
-    owncertificate: true # if true, the certificate is an AWS hosted certificate
-    upstream: "https://ifconfig.me"
-```
-
-### Execute asset provisioning
-
-Script checks if asserts already exist and if not, creates them. It also uploads custom certificates as provided in files. 
-
-```shell
-# check assets to create
-cat assets.yaml
-
-# execute deployment
-dotenvx run -- deno run -A deploy-waf-with-own-cert.ts
-```
-
-### Expected results
-
-Assets are created per YAML declaration in `assets.yaml` file.
-Uploaded certificates are used for the assets and can be confirmed in the UI under the profile.
-
-![alt text](img/domain-cert-uploaded.png)
-
-Execution
-
-```shell
-# execute deployment - all is done, so we check only state of Deployment
-dotenvx run -- deno run -A deploy-waf-with-own-cert.ts
-```
-
-### Troubleshooting
-
-- so far this is PoC/concept and if you want to run again for same list of assets, you might want to delete them first, publish&enforce and start again
+  - name: "example-asset"
+    domain: "https://example.com, https://example2.com"
+    upstream: "https://upstream.example.com"
+    owncertificate: true
+    cert_pem: "/path/to/cert.pem"
+    cert_key: "/path/to/key.pem"
+  - name: "another-asset"
+    domain: "https://another.com"
+    upstream: "https://upstream.another.com"
+    owncertificate: false
