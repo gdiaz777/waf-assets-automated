@@ -8,8 +8,6 @@ assets:
     domain: "https://example1.es, https://example11.es, https://example111.com"
     owncertificate: true
     upstream: "https://httpbin.org"
-    cert_pem: "example1.crt"
-    cert_key: "example1.key"
   
   - name: "test2"
     domain: "https://example2.es, https://example22.es"
