@@ -1,37 +1,37 @@
 // ============================================================================
 // deploy-assets-checkpoint-waf-saas.ts
 // ----------------------------------------------------------------------------
-// Despliega assets (aplicaciones web) en Check Point CloudGuard WAF SaaS /
-// Infinity Next a partir del fichero assets.yaml. Soporta dos modos de
-// certificado: cert propio (BYOC) y cert gestionado por el WAF (WAF_MANAGED).
+// Deploys assets (web applications) to Check Point CloudGuard WAF SaaS /
+// Infinity Next from the assets.yaml file. Supports two certificate modes:
+// own certificate (BYOC) and WAF-managed certificate (WAF_MANAGED).
 //
-// Optimización: la operación publishAndEnforce — costosa porque dispara la
-// validación + propagación de la política a todo el data plane — se ejecuta
-// UNA SOLA VEZ al final, después de crear todos los assets pendientes.
+// Optimization: publishAndEnforce — expensive because it triggers the
+// validation + propagation of the policy to the whole data plane — is
+// executed ONLY ONCE at the end, after creating all pending assets.
 // ============================================================================
 
 import { parse as parseYaml } from "jsr:@std/yaml";
 
-// Endpoint GraphQL del Infinity Portal para el servicio WAF.
-// La doble barra "//graphql" es la URL real que usa el portal — no es typo.
+// GraphQL endpoint of the Infinity Portal for the WAF service.
+// The double slash "//graphql" is the actual URL the portal uses — not a typo.
 const WAF_GRAPHQL_URL = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
 
-// Mapeo del flag "owncertificate" del YAML al valor del enum saasCertificateType
-// que espera la API. "BYOC" está confirmado vía HAR. "WAF_MANAGED" es la
-// hipótesis para el flujo gestionado — si Check Point lo rechaza, capturar un
-// HAR creando un asset con cert AWS-managed y ajustar el valor aquí.
+// Mapping from the YAML "owncertificate" flag to the saasCertificateType enum
+// expected by the API. "BYOC" is confirmed via HAR. "WAF_MANAGED" is the
+// assumed value for the managed flow — if Check Point rejects it, capture a
+// HAR creating an asset with an AWS-managed cert and adjust the value here.
 const SAAS_CERT_TYPE_BYOC = "BYOC";
 const SAAS_CERT_TYPE_WAF_MANAGED = "WAF_MANAGED";
 
-// Estado global del proceso. Se rellena al inicio de main() y se reusa en todas
-// las funciones para no tener que pasar los mismos argumentos por todas partes.
-let wafSession: any = null;     // Respuesta del login WAF (contiene el JWT en data.token).
-let PROFILE: string | null = null;       // Nombre del profile AppSecSaaS objetivo.
-let REGION: string | null = null;        // Región del profile (ej. "eu-west-1").
-let PROFILE_PID: string | null = null;   // UUID del profile, resuelto en runtime a partir del nombre.
-let FILEPATH: string | null = null;      // Ruta del log de salida con timestamp.
+// Global process state. Filled in at the start of main() and reused by all
+// functions to avoid having to pass the same arguments around.
+let wafSession: any = null;     // WAF login response (contains the JWT in data.token).
+let PROFILE: string | null = null;       // Target AppSecSaaS profile name.
+let REGION: string | null = null;        // Profile region (e.g. "eu-west-1").
+let PROFILE_PID: string | null = null;   // Profile UUID, resolved at runtime from its name.
+let FILEPATH: string | null = null;      // Output log path with timestamp.
 
-// Carga y parsea un fichero YAML. Devuelve null si el parseo falla.
+// Loads and parses a YAML file. Returns null if parsing fails.
 async function loadConfig(filename: string) {
     const configText = await Deno.readTextFile(filename);
     try {
@@ -42,9 +42,9 @@ async function loadConfig(filename: string) {
     }
 }
 
-// Login en el Infinity Portal. Recibe la URL de auth y las credenciales de la
-// API key (servicio "Web Application & API Protection") y devuelve el objeto
-// con el token JWT que se usará como Bearer en todas las llamadas siguientes.
+// Logs in to the Infinity Portal. Takes the auth URL and the API key
+// credentials (service "Web Application & API Protection") and returns the
+// object with the JWT used as Bearer in every subsequent call.
 async function wafLogin(url: string, clientId: string, accessKey: string) {
     try {
         const response = await fetch(url, {
@@ -64,9 +64,9 @@ async function wafLogin(url: string, clientId: string, accessKey: string) {
     return null;
 }
 
-// Resuelve el UUID del profile (PROFILE_PID) a partir de su nombre.
-// Lista todos los profiles del tenant y filtra por la coincidencia exacta del
-// nombre configurado en el YAML.
+// Resolves the profile UUID (PROFILE_PID) from its name.
+// Lists all profiles in the tenant and filters by exact name match against
+// the value configured in the YAML.
 async function wafProfiles() {
     const token = wafSession?.data?.token;
     const headers = {
@@ -104,11 +104,11 @@ async function wafProfiles() {
     return null;
 }
 
-// Lista assets (aplicaciones web) usando la nueva query getWafAssets.
-// El filtro class:["workload"] limita a assets de tipo aplicación, lo que
-// reemplaza la antigua query AssetsName/getAssets que devolvía todos los
-// objetos. matchSearch hace búsqueda parcial — luego se filtra por nombre
-// exacto en el caller.
+// Lists assets (web applications) using the new getWafAssets query.
+// The class:["workload"] filter restricts results to application-type assets,
+// replacing the older AssetsName/getAssets query that returned every object.
+// matchSearch performs a partial match — exact-name filtering is done by the
+// caller.
 async function getWafAssets(matchSearch: string | undefined) {
     const token = wafSession?.data?.token;
     const headers = {
@@ -140,9 +140,9 @@ async function getWafAssets(matchSearch: string | undefined) {
     return null;
 }
 
-// Pre-flight de unicidad de nombre. Devuelve true si el nombre está libre.
-// El portal lo llama antes del wizard para evitar errores en mid-create:
-// es más barato fallar aquí que recibir un fallo a mitad de newAssetByWizard.
+// Name-uniqueness pre-flight. Returns true if the name is free.
+// The portal calls this before the wizard to fail fast: it is cheaper to
+// reject here than to receive a mid-create error from newAssetByWizard.
 async function validateName(name: string): Promise<boolean> {
     const token = wafSession?.data?.token;
     const headers = {
@@ -167,9 +167,9 @@ async function validateName(name: string): Promise<boolean> {
     return data?.data?.validateName === true;
 }
 
-// Publica los cambios pendientes (asíncrono). Reemplaza al antiguo
-// publishChanges (síncrono). Devuelve inmediatamente; la validación corre en
-// background. La aplicación real al data plane la dispara enforcePolicy.
+// Publishes pending changes (asynchronous). Replaces the old synchronous
+// publishChanges. Returns immediately; validation runs in the background.
+// Actual propagation to the data plane is triggered by enforcePolicy.
 async function asyncPublishChanges() {
     const token = wafSession?.data?.token;
     const headers = {
@@ -179,9 +179,9 @@ async function asyncPublishChanges() {
     const body = {
         operationName: "asyncPublishChanges",
         variables: {
-            // Tipos de profile cuyas configuraciones se publican. Incluimos
-            // todos los tipos relevantes para el WAF SaaS para que un solo
-            // publish cubra mixed deployments.
+            // Profile types whose configurations get published. Including all
+            // WAF SaaS-relevant types lets a single publish cover mixed
+            // deployments.
             profileTypes: ["Docker", "CloudGuardAppSecGateway", "Embedded", "Kubernetes", "AppSecSaaS"],
         },
         query: "mutation asyncPublishChanges($profileTypes: [ProfileType!], $skipNginxValidation: Boolean) {\n  asyncPublishChanges(\n    profileTypes: $profileTypes\n    skipNginxValidation: $skipNginxValidation\n  )\n}\n",
@@ -201,8 +201,8 @@ async function asyncPublishChanges() {
     return null;
 }
 
-// Aplica la política publicada a los enforcement points. Devuelve un task
-// asíncrono que se monitoriza con waitForTask().
+// Applies the published policy to the enforcement points. Returns an async
+// task that is monitored with waitForTask().
 async function enforcePolicy() {
     const token = wafSession?.data?.token;
     const headers = {
@@ -231,8 +231,8 @@ async function enforcePolicy() {
     return null;
 }
 
-// Polling de estado del task con backoff fijo de 2s. Sale cuando el estado
-// deja de ser InProgress (= Succeeded, Failed, etc.).
+// Polls the task status with a fixed 2s backoff. Exits when the status is no
+// longer InProgress (i.e. Succeeded, Failed, etc.).
 async function waitForTask(taskId: string) {
     console.log("Waiting for taskId:", taskId);
     while (true) {
@@ -244,7 +244,7 @@ async function waitForTask(taskId: string) {
     }
 }
 
-// Lee el estado de un task asíncrono por su id.
+// Reads the status of an async task by its id.
 async function getTask(taskid: string) {
     const token = wafSession?.data?.token;
     const headers = {
@@ -269,9 +269,9 @@ async function getTask(taskid: string) {
     return null;
 }
 
-// Combina publish + enforce + espera al task. Si publish falla, se hace
-// discardChanges() para dejar el draft del tenant limpio y no contaminar
-// futuras ejecuciones.
+// Combines publish + enforce + waiting for the task. If publish fails,
+// discardChanges() is called to leave the tenant draft clean and avoid
+// contaminating future executions.
 async function publishAndEnforce() {
     console.log("Publishing changes...");
     const publish = await asyncPublishChanges();
@@ -287,11 +287,11 @@ async function publishAndEnforce() {
     return true;
 }
 
-// Crea un asset (aplicación web) vía wizard.
-//   - ownCertificate: true  → BYOC (el cert se sube luego con upload-certificate-...)
-//   - ownCertificate: false → WAF_MANAGED (cert auto-provisionado por Check Point)
+// Creates an asset (web application) via the wizard.
+//   - ownCertificate: true  → BYOC (the cert is uploaded later with upload-certificate-...)
+//   - ownCertificate: false → WAF_MANAGED (cert auto-provisioned by Check Point)
 //
-// La diferencia entre ambos modos en la API es:
+// The difference between the two modes in the API is:
 //   - assetInput.deployCertificateManually: true (BYOC) | false (WAF_MANAGED)
 //   - profileInput.saasCertificateType:     "BYOC"      | "WAF_MANAGED"
 async function newAssetByWizard(assetData: {
@@ -315,42 +315,42 @@ async function newAssetByWizard(assetData: {
         operationName: "newAssetByWizard",
         variables: {
             assetType: "WebApplication",
-            // Datos propios del asset (la aplicación web).
+            // Asset (web application) data.
             assetInput: {
                 name: assetData.name,
-                URLs: assetData.domain,                  // Array de URLs https://...
+                URLs: assetData.domain,                  // Array of https://... URLs
                 tags: [],
-                stage: "Staging",                        // Estado de despliegue inicial
-                // Campos AIGuard/LLM — vacíos cuando no aplica:
+                stage: "Staging",                        // Initial deployment stage
+                // AIGuard/LLM fields — empty when not applicable:
                 uriPromptPairs: [],
                 expectedPrompts: "wide",
                 expectedUsers: "all",
                 applicationDescription: "",
                 llmModel: "",
-                // Cómo identificar el cliente real detrás de un proxy/CDN:
+                // How to identify the real client behind a proxy/CDN:
                 sourceIdentifiers: [{ sourceIdentifier: "XForwardedFor", values: [] }],
                 deployCertificateManually: assetData.ownCertificate,
                 state: "Active",
                 upstreamURL: assetData.upstream,
             },
-            // Datos del profile al que se asocia el asset.
+            // Data of the profile the asset is attached to.
             profileInput: {
                 name: assetData.profileName,
                 id: assetData.profileId,
                 profileType: "AppSecSaaS",
                 onlyDefinedApplications: false,
-                // Campos para perfiles no-SaaS — null en SaaS:
+                // Fields used by non-SaaS profiles — null in SaaS:
                 certificateType: null,
                 vendor: null,
                 isSelfManaged: false,
                 region: assetData.region,
-                saasCertificateType,                      // ← clave de la decisión BYOC vs WAF_MANAGED
+                saasCertificateType,                      // ← key driver of the BYOC vs WAF_MANAGED choice
             },
             zoneInput: {},
-            // Política de fuentes para el behaviour engine.
+            // Source policy for the behaviour engine.
             parameterInput: { numOfSources: 3, sourcesIdentifiers: [] },
-            // Prácticas de seguridad por defecto. Mantienen los modos exactos
-            // que aplica el wizard del portal.
+            // Default security practices. Mirrors exactly the modes the
+            // portal wizard applies.
             practiceInput: [
                 {
                     practiceType: "WebApplication",
@@ -370,8 +370,9 @@ async function newAssetByWizard(assetData: {
                     ],
                 },
                 {
-                    // AIGuard se incluye desactivado por defecto — el portal lo
-                    // envía aunque no haya configuración LLM, replicamos.
+                    // AIGuard is included disabled by default — the portal
+                    // sends it even when there is no LLM configuration, we
+                    // mirror that.
                     practiceType: "AIGuard",
                     modes: [
                         { mode: "Disabled", subPractice: "" },
@@ -393,7 +394,7 @@ async function newAssetByWizard(assetData: {
     });
     if (response.ok) {
         const data = await response.json();
-        // GraphQL puede devolver 200 OK con errores en data.errors.
+        // GraphQL can return 200 OK with errors in data.errors.
         if (data?.errors) {
             console.error("newAssetByWizard returned errors:", data.errors);
             return null;
@@ -406,9 +407,9 @@ async function newAssetByWizard(assetData: {
     return null;
 }
 
-// Wrapper de creación: traduce el formato del YAML al objeto que espera
-// newAssetByWizard. Devuelve true si el asset se creó (para que main()
-// pueda decidir si publicar al final), false si falló o se omitió.
+// Creation wrapper: translates the YAML format into the object expected by
+// newAssetByWizard. Returns true if the asset was created (so main() can
+// decide whether to publish at the end), false if it failed or was skipped.
 async function createAsset(assetData: any): Promise<boolean> {
     const { ASSET_DOMAIN, ASSET_NAME, ASSET_CERTIFICATE_TYPE, ASSET_UPSTREAM } = assetData;
 
@@ -445,9 +446,8 @@ async function createAsset(assetData: any): Promise<boolean> {
     return true;
 }
 
-// Descarta el draft de cambios del tenant. Se usa como rollback si publish
-// falla, para no dejar configuración pendiente que afecte a futuras
-// ejecuciones del script.
+// Discards the tenant change draft. Used as a rollback when publish fails so
+// no dangling configuration affects subsequent script runs.
 async function discardChanges(): Promise<any> {
     const token = wafSession?.data?.token;
     const headers = {
@@ -478,8 +478,8 @@ async function discardChanges(): Promise<any> {
     return null;
 }
 
-// Append a un fichero de log. Errores se ignoran silenciosamente para no
-// romper el flujo principal por un problema de IO en el log.
+// Append to a log file. Errors are silently ignored to avoid breaking the
+// main flow because of an IO problem on the log.
 async function writeToFile(filePath: string, input: string) {
     try {
         await Deno.writeTextFile(filePath, input, { append: true });
@@ -487,12 +487,12 @@ async function writeToFile(filePath: string, input: string) {
 }
 
 async function main() {
-    // Log con timestamp de la ejecución, en el directorio actual.
+    // Timestamped run log in the current directory.
     const now = new Date();
     const formattedDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}`;
     FILEPATH = `./${formattedDate}_deploy-assets_output.log`;
 
-    // 1. Cargar configuración (assets.yaml) y credenciales (.env vía dotenvx).
+    // 1. Load configuration (assets.yaml) and credentials (.env via dotenvx).
     const config: any = await loadConfig("assets.yaml");
     console.log("config:", JSON.stringify(config, null, 2));
 
@@ -504,7 +504,7 @@ async function main() {
     const clientId = Deno.env.get("WAFKEY")!;
     const accessKey = Deno.env.get("WAFSECRET")!;
 
-    // 2. Login + resolver UUID del profile (una sola vez para todo el batch).
+    // 2. Login + resolve profile UUID (only once for the whole batch).
     wafSession = await wafLogin(url, clientId, accessKey);
     if (!wafSession) {
         console.error("Failed to login to WAF");
@@ -519,13 +519,14 @@ async function main() {
 
     if (!config?.assets) return;
 
-    // 3. Bucle por cada asset del YAML — solo CREAR aquí, sin publicar todavía.
-    //    Acumulamos el contador de creados; si alguno se creó disparamos un
-    //    único publishAndEnforce al final (optimización para grandes cargas).
+    // 3. Loop over every asset in the YAML — only CREATE here, do not publish
+    //    yet. We accumulate the count of created assets; if at least one was
+    //    created we trigger a single publishAndEnforce at the end (large-batch
+    //    optimization).
     let createdCount = 0;
 
     for (const asset of config.assets) {
-        // El YAML permite varias URLs separadas por coma — las troceamos.
+        // The YAML allows several URLs separated by comma — split them.
         const assetDomainsArray = asset.domain.split(",").map((d: string) => d.trim());
         const assetDataInput = {
             ASSET_DOMAIN: assetDomainsArray,
@@ -537,7 +538,7 @@ async function main() {
 
         console.log("--------- ASSET ", assetDataInput.ASSET_NAME, "started ---------");
 
-        // Idempotencia: si el asset ya existe con ese nombre, lo saltamos.
+        // Idempotency: if an asset with that name already exists, skip it.
         const specificAsset = await getWafAssets(assetDataInput.ASSET_NAME);
         const matchingAsset = specificAsset?.find((a: any) => a.name === assetDataInput.ASSET_NAME);
 
@@ -545,8 +546,8 @@ async function main() {
             console.log("Asset", matchingAsset.name, "already exists with ID", matchingAsset.id, "Skipping Asset");
             await writeToFile(FILEPATH, `Asset ${matchingAsset.name} already exists with ID ${matchingAsset.id}\n`);
         } else {
-            // Pre-flight de unicidad antes de invocar el wizard. Si el nombre
-            // ya está reservado por otro tipo de objeto, salta directamente.
+            // Uniqueness pre-flight before invoking the wizard. If the name
+            // is already reserved by another object type, skip immediately.
             const nameFree = await validateName(assetDataInput.ASSET_NAME);
             if (!nameFree) {
                 console.error(`Asset name "${assetDataInput.ASSET_NAME}" is not valid/unique. Skipping.`);
@@ -560,9 +561,9 @@ async function main() {
         console.log("--------- ASSET ", assetDataInput.ASSET_NAME, "end ---------");
     }
 
-    // 4. Publish + enforce UNA SOLA VEZ al final, solo si hubo creaciones.
-    //    Esta es la optimización para grandes cargas: evitamos N pares de
-    //    publish/enforce innecesarios cuando se procesan muchos assets.
+    // 4. Publish + enforce ONLY ONCE at the end, only if anything was created.
+    //    This is the large-batch optimization: it avoids N unnecessary
+    //    publish/enforce pairs when many assets are processed.
     if (createdCount > 0) {
         console.log(`========== Publishing ${createdCount} new asset(s) in a single batch ==========`);
         const ok = await publishAndEnforce();

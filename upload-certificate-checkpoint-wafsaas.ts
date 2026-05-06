@@ -1,33 +1,34 @@
 // ============================================================================
 // upload-certificate-checkpoint-wafsaas.ts
 // ----------------------------------------------------------------------------
-// Sube certificados SSL/TLS propios (BYOC) a Check Point CloudGuard WAF SaaS /
-// Infinity Next y los enlaza a los dominios de assets que ya existen en el
-// profile.
+// Uploads BYOC SSL/TLS certificates to Check Point CloudGuard WAF SaaS /
+// Infinity Next and links them to the domains of assets that already exist
+// in the profile.
 //
-// Modelo de seguridad: la private key NUNCA viaja en claro. Se cifra
-// localmente con AES-CBC; la clave AES se cifra con la public key RSA-OAEP
-// que entrega el backend (cifrado híbrido). Solo Check Point puede descifrar
-// con su private key, y solo entonces obtiene la AES key para abrir el blob.
+// Security model: the private key NEVER travels in clear. It is encrypted
+// locally with AES-CBC; the AES key is encrypted with the RSA-OAEP public
+// key the backend hands out (hybrid encryption). Only Check Point can
+// decrypt with their RSA private key, and only then can they recover the
+// AES key to open the blob.
 //
-// Optimización: publishAndEnforce se llama UNA SOLA VEZ al final, solo si al
-// menos un certificado se subió correctamente.
+// Optimization: publishAndEnforce is called ONLY ONCE at the end, and only
+// if at least one certificate was uploaded successfully.
 // ============================================================================
 
 import { encode as encodeBase64 } from "https://deno.land/std@0.208.0/encoding/base64.ts";
 import { parse as parseYaml } from "jsr:@std/yaml";
 
-// Endpoint GraphQL del Infinity Portal para WAF (la doble barra es real).
+// Infinity Portal WAF GraphQL endpoint (the double slash is intentional).
 const WAF_GRAPHQL_URL = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
 
-// Estado global del proceso. Se rellena en main() y se reusa en las funciones.
-let wafSession: any = null;     // Respuesta del login (contiene el JWT en data.token).
-let PROFILE: string | null = null;       // Nombre del profile AppSecSaaS objetivo.
-let REGION: string | null = null;        // Región del profile.
-let PROFILE_PID: string | null = null;   // UUID del profile.
-let FILEPATH: string | null = null;      // Ruta del log de salida con timestamp.
+// Global process state. Filled in inside main() and reused across functions.
+let wafSession: any = null;     // Login response (contains the JWT in data.token).
+let PROFILE: string | null = null;       // Target AppSecSaaS profile name.
+let REGION: string | null = null;        // Profile region.
+let PROFILE_PID: string | null = null;   // Profile UUID.
+let FILEPATH: string | null = null;      // Output log path with timestamp.
 
-// Carga y parsea un fichero YAML.
+// Loads and parses a YAML file.
 async function loadConfig(filename: string) {
     const configText = await Deno.readTextFile(filename);
     try {
@@ -39,7 +40,7 @@ async function loadConfig(filename: string) {
     }
 }
 
-// Login en el Infinity Portal. Devuelve el objeto que contiene el JWT.
+// Logs in to the Infinity Portal. Returns the object holding the JWT.
 async function wafLogin(url: string, clientId: string, accessKey: string) {
     try {
         const response = await fetch(url, {
@@ -60,7 +61,7 @@ async function wafLogin(url: string, clientId: string, accessKey: string) {
     return null;
 }
 
-// Resuelve el UUID del profile a partir de su nombre (PROFILE).
+// Resolves the profile UUID from its name (PROFILE).
 async function wafProfiles() {
     const token = wafSession?.data?.token;
     const headers = {
@@ -98,9 +99,9 @@ async function wafProfiles() {
     return null;
 }
 
-// Publica los cambios del tenant (asíncrono). Reemplaza al antiguo
-// publishChanges. La validación corre en background; la propagación al data
-// plane la dispara enforcePolicy.
+// Publishes pending tenant changes (asynchronous). Replaces the old
+// publishChanges. Validation runs in the background; propagation to the
+// data plane is triggered separately by enforcePolicy.
 async function asyncPublishChanges() {
     const token = wafSession?.data?.token;
     const headers = {
@@ -129,8 +130,8 @@ async function asyncPublishChanges() {
     return null;
 }
 
-// Aplica la política publicada a los enforcement points. Devuelve un task
-// asíncrono que se monitoriza con waitForTask().
+// Applies the published policy to the enforcement points. Returns an async
+// task that is monitored with waitForTask().
 async function enforcePolicy() {
     const token = wafSession?.data?.token;
     const headers = {
@@ -159,8 +160,8 @@ async function enforcePolicy() {
     return null;
 }
 
-// Polling del estado del task con backoff fijo de 2s. Sale cuando el estado
-// deja de ser InProgress.
+// Polls the task status with a fixed 2s backoff. Exits when the status is
+// no longer InProgress.
 async function waitForTask(taskId: string) {
     console.log("Waiting for taskId:", taskId);
     while (true) {
@@ -172,7 +173,7 @@ async function waitForTask(taskId: string) {
     }
 }
 
-// Lee el estado de un task asíncrono por su id.
+// Reads the status of an async task by its id.
 async function getTask(taskid: string) {
     const token = wafSession?.data?.token;
     const headers = {
@@ -197,7 +198,7 @@ async function getTask(taskid: string) {
     return null;
 }
 
-// Combina publish + enforce + espera al task.
+// Combines publish + enforce + wait for task.
 async function publishAndEnforce() {
     console.log("Publishing changes...");
     const publish = await asyncPublishChanges();
@@ -213,9 +214,9 @@ async function publishAndEnforce() {
     return true;
 }
 
-// Pide al backend la public key RSA con la que cifrar la AES key local.
-// sensitiveFieldName "nexusCertificate" identifica el tipo de secreto que
-// vamos a subir; el backend devuelve la public key adecuada para ese campo.
+// Asks the backend for the RSA public key used to encrypt the local AES key.
+// sensitiveFieldName "nexusCertificate" identifies the kind of secret we are
+// uploading; the backend returns the public key bound to that field.
 async function getEncryptionPublicKey(profileId: string, region: string) {
     const token = wafSession?.data?.token;
     const headers = {
@@ -246,25 +247,25 @@ async function getEncryptionPublicKey(profileId: string, region: string) {
     return null;
 }
 
-// Cifrado híbrido AES-CBC + RSA-OAEP. Los pasos son:
-//   1. Generar AES-256 key + IV de 16 bytes aleatorios (Web Crypto API).
-//   2. Cifrar la private key del cert con AES-CBC.
-//   3. Importar la public key del backend (formato SPKI/PEM).
-//   4. Cifrar la AES key con RSA-OAEP / SHA-256.
-//   5. Devolver dos blobs base64:
+// Hybrid AES-CBC + RSA-OAEP encryption. The steps are:
+//   1. Generate a random AES-256 key + 16-byte IV (Web Crypto API).
+//   2. Encrypt the cert's private key with AES-CBC.
+//   3. Import the backend public key (SPKI/PEM format).
+//   4. Encrypt the AES key with RSA-OAEP / SHA-256.
+//   5. Return two base64 blobs:
 //      - encryptedData = IV || ciphertext (AES)
-//      - encryptedKey  = AES key cifrada con RSA
-// Ambos blobs viajan al backend; solo Check Point puede descifrar el primero
-// porque solo ellos tienen la private key RSA emparejada.
+//      - encryptedKey  = AES key encrypted with RSA
+// Both blobs are sent to the backend; only Check Point can decrypt the
+// first one because only they hold the matching RSA private key.
 const encryptPrivateKey = async (privateKey: string, publicKeyPem: string) => {
     try {
-        // 1. Material aleatorio fresco para cada certificado.
+        // 1. Fresh random material per certificate.
         const aesKey = crypto.getRandomValues(new Uint8Array(32));
         const iv = crypto.getRandomValues(new Uint8Array(16));
 
         const privateKeyBuffer = new TextEncoder().encode(privateKey);
 
-        // 2. AES-CBC sobre la private key.
+        // 2. AES-CBC over the private key.
         const aesCryptoKey = await crypto.subtle.importKey("raw", aesKey, "AES-CBC", false, ["encrypt"]);
         const encryptedData = await crypto.subtle.encrypt(
             { name: "AES-CBC", iv },
@@ -275,8 +276,8 @@ const encryptPrivateKey = async (privateKey: string, publicKeyPem: string) => {
         const encryptedDataBase64 = encodeBase64(new Uint8Array(encryptedData));
         const ivBase64 = encodeBase64(iv);
 
-        // 3. Decodificar la public key PEM → SPKI binario.
-        //    Quitamos cabecera/pie y saltos de línea, base64-decode el cuerpo.
+        // 3. Decode the public key PEM → SPKI binary.
+        //    Strip header/footer and newlines, base64-decode the body.
         const pemHeader = "-----BEGIN PUBLIC KEY-----";
         const pemFooter = "-----END PUBLIC KEY-----";
         const pemContents = publicKeyPem
@@ -286,7 +287,7 @@ const encryptPrivateKey = async (privateKey: string, publicKeyPem: string) => {
 
         const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
 
-        // 4. Importar la public key como RSA-OAEP / SHA-256.
+        // 4. Import the public key as RSA-OAEP / SHA-256.
         const publicKey = await crypto.subtle.importKey(
             "spki",
             binaryDer,
@@ -295,12 +296,13 @@ const encryptPrivateKey = async (privateKey: string, publicKeyPem: string) => {
             ["encrypt"],
         );
 
-        // 5. Cifrar la AES key con RSA-OAEP.
+        // 5. Encrypt the AES key with RSA-OAEP.
         const encryptedAesKey = await crypto.subtle.encrypt({ name: "RSA-OAEP" }, publicKey, aesKey);
         const encryptedKeyBase64 = encodeBase64(new Uint8Array(encryptedAesKey));
 
-        // El IV se concatena al inicio del ciphertext (convención esperada
-        // por el backend) en lugar de enviarse como campo aparte.
+        // The IV is concatenated to the start of the ciphertext (the
+        // convention the backend expects) instead of being sent as a
+        // separate field.
         return {
             encryptedData: ivBase64 + encryptedDataBase64,
             encryptedKey: encryptedKeyBase64,
@@ -311,8 +313,8 @@ const encryptPrivateKey = async (privateKey: string, publicKeyPem: string) => {
     }
 };
 
-// Genera el sufijo de timestamp con el formato que usa el portal para los
-// nombres de fichero del cert/key (ej. "06-May-2026_18:30:42").
+// Generates the timestamp suffix in the format the portal uses for the
+// cert/key file names (e.g. "06-May-2026_18:30:42").
 function portalTimestamp(): string {
     const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     const d = new Date();
@@ -325,18 +327,19 @@ function portalTimestamp(): string {
     return `${dd}-${mmm}-${yyyy}_${hh}:${mi}:${ss}`;
 }
 
-// Crea un certificado SaaS BYOC (Bring Your Own Cert) como objeto de primer
-// nivel en la plataforma. Reemplaza al antiguo addSensitiveField + payload de
-// updateDomainCertificate. Devuelve el certificateId del certificado creado.
+// Creates a SaaS BYOC (Bring Your Own Cert) certificate as a first-class
+// object on the platform. Replaces the old addSensitiveField + the payload
+// of updateDomainCertificate. Returns the certificateId of the new object.
 //
-// Notas sobre el input:
-//   - certificateType "BYOC"  → cert propio (no AWS-managed).
-//   - encryptedFieldValue/Key → blobs del cifrado híbrido (encryptPrivateKey).
-//   - certificate              → fullchain PEM EN CLARO (la parte pública no es secreta).
-//   - certificateFile          → mismo PEM en data URL base64 (el portal lo usa
-//                                para mostrar/descargar el fichero).
-//   - regions: array — permite multi-región para un mismo cert.
-//   - domain: el cert nace ya asociado a este dominio; el link se hace luego.
+// Notes about the input:
+//   - certificateType "BYOC"  → own cert (not AWS-managed).
+//   - encryptedFieldValue/Key → blobs from the hybrid encryption (encryptPrivateKey).
+//   - certificate              → fullchain PEM IN CLEAR (the public part is not secret).
+//   - certificateFile          → same PEM as a base64 data URL (the portal
+//                                uses it to display/download the file).
+//   - regions: array — allows multi-region for a single cert.
+//   - domain: the cert is born linked to this domain; the explicit link
+//     happens later via linkSaasCertificate.
 async function createSaasCertificate(
     profileId: string,
     region: string,
@@ -378,7 +381,7 @@ async function createSaasCertificate(
     });
     if (response.ok) {
         const data = await response.json();
-        // La API GraphQL puede devolver 200 OK con errores en data.errors.
+        // The GraphQL API can return 200 OK with errors in data.errors.
         if (data?.errors) {
             console.error("createSaasCertificate returned errors:", data.errors);
             return null;
@@ -392,11 +395,11 @@ async function createSaasCertificate(
     return null;
 }
 
-// Enlaza un certificado existente a un dominio. Reemplaza al antiguo
-// updateDomainCertificate. La API moderna trabaja con dos identificadores
-// simples (domain + certificateId) en lugar del antiguo certificateParameter.id.
-// Esto permite que un mismo certificado (wildcard/SAN) se pueda enlazar a
-// varios dominios sin reuploads.
+// Links an existing certificate to a domain. Replaces the old
+// updateDomainCertificate. The modern API works with two simple identifiers
+// (domain + certificateId) instead of the old certificateParameter.id.
+// This lets the same certificate (wildcard/SAN) be linked to several
+// domains without re-uploads.
 async function linkSaasCertificate(domain: string, certificateId: string) {
     const token = wafSession?.data?.token;
     const headers = {
@@ -427,7 +430,7 @@ async function linkSaasCertificate(domain: string, certificateId: string) {
     return null;
 }
 
-// Descarta el draft del tenant. Rollback si publish falla.
+// Discards the tenant draft. Rollback when publish fails.
 async function discardChanges(): Promise<any> {
     const token = wafSession?.data?.token;
     const headers = {
@@ -458,7 +461,8 @@ async function discardChanges(): Promise<any> {
     return null;
 }
 
-// Append a fichero de log (errores se ignoran para no romper el flujo).
+// Append to a log file (errors are silently ignored to avoid breaking the
+// main flow).
 async function writeToFile(filePath: string, input: string) {
     try {
         await Deno.writeTextFile(filePath, input, { append: true });
@@ -466,12 +470,12 @@ async function writeToFile(filePath: string, input: string) {
 }
 
 async function main() {
-    // Log con timestamp en el directorio actual.
+    // Timestamped log in the current directory.
     const now = new Date();
     const formattedDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}`;
     FILEPATH = `./${formattedDate}_upload-certificates_output.log`;
 
-    // 1. Cargar configuración (certificates.yaml) y credenciales (.env).
+    // 1. Load configuration (certificates.yaml) and credentials (.env).
     const config: any = await loadConfig("certificates.yaml");
     console.log("config:", JSON.stringify(config, null, 2));
 
@@ -483,7 +487,7 @@ async function main() {
     const clientId = Deno.env.get("WAFKEY")!;
     const accessKey = Deno.env.get("WAFSECRET")!;
 
-    // 2. Login + resolver UUID del profile.
+    // 2. Login + resolve the profile UUID.
     wafSession = await wafLogin(url, clientId, accessKey);
     if (!wafSession) {
         console.error("Failed to login to WAF");
@@ -498,9 +502,9 @@ async function main() {
 
     if (!config?.urls) return;
 
-    // 3. Bucle por cada URL — solo crear+enlazar el certificado, sin publicar
-    //    aún. Usamos el flag anySuccess para decidir si vale la pena el
-    //    publish/enforce final (optimización para grandes cargas).
+    // 3. Loop over every URL — only create+link the certificate, do not
+    //    publish yet. The anySuccess flag decides whether the final
+    //    publish/enforce is worth running (large-batch optimization).
     let anySuccess = false;
 
     for (const asset of config.urls) {
@@ -512,20 +516,20 @@ async function main() {
         };
         console.log("--------- URL ", assetDataInput.ASSET_URL, "started ---------");
 
-        // 3a. Pedir public key fresca por cada cert (es barato y permite
-        //     que el backend rote sin rompernos).
+        // 3a. Ask for a fresh public key per cert (it is cheap and lets the
+        //     backend rotate without breaking us).
         const publicKey = await getEncryptionPublicKey(PROFILE_PID!, REGION!);
         if (!publicKey) {
             await writeToFile(FILEPATH, `Certificate upload failed (no public key) ${assetDataInput.ASSET_URL}\n`);
             continue;
         }
 
-        // 3b. Leer cert + key del disco. La key debe estar SIN passphrase y
-        //     el cert debe ser fullchain (cert hoja + intermedios).
+        // 3b. Read cert + key from disk. The key MUST have no passphrase
+        //     and the cert MUST be fullchain (leaf cert + intermediates).
         const key = await Deno.readTextFile(assetDataInput.ASSET_CERT_KEY);
         const cert = await Deno.readTextFile(assetDataInput.ASSET_CERT_PEM);
 
-        // 3c. Cifrar la private key (híbrido AES + RSA).
+        // 3c. Encrypt the private key (hybrid AES + RSA).
         const encrypted = await encryptPrivateKey(key, publicKey);
         if (!encrypted.encryptedData || !encrypted.encryptedKey) {
             await writeToFile(FILEPATH, `Certificate upload failed (encryption error) ${assetDataInput.ASSET_URL}\n`);
@@ -533,7 +537,7 @@ async function main() {
         }
         console.log("Encrypted public key and private key");
 
-        // 3d. Crear el objeto certificado en la plataforma.
+        // 3d. Create the certificate object on the platform.
         const certificateId = await createSaasCertificate(
             PROFILE_PID!,
             REGION!,
@@ -549,7 +553,7 @@ async function main() {
             continue;
         }
 
-        // 3e. Enlazar el certificado al dominio del asset.
+        // 3e. Link the certificate to the asset's domain.
         const linkResult = await linkSaasCertificate(assetDataInput.ASSET_DOMAIN, certificateId);
         if (linkResult === null) {
             await writeToFile(FILEPATH, `Certificate uploaded but link failed ${assetDataInput.ASSET_URL}\n`);
@@ -562,9 +566,9 @@ async function main() {
         console.log("--------- URL ", assetDataInput.ASSET_URL, "end ---------");
     }
 
-    // 4. Publish + enforce UNA SOLA VEZ al final, solo si subimos al menos un
-    //    certificado. Optimización para cargas grandes: evitamos N pares de
-    //    publish/enforce innecesarios cuando se procesan muchos certs.
+    // 4. Publish + enforce ONLY ONCE at the end, only if at least one
+    //    certificate was uploaded. Large-batch optimization: avoids N
+    //    unnecessary publish/enforce pairs when many certs are processed.
     if (anySuccess) {
         const ok = await publishAndEnforce();
         if (!ok) {

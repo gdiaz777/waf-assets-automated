@@ -1,81 +1,81 @@
 # WAF SaaS Deployment and Certificate Upload Scripts
 
-Este repositorio contiene dos scripts en Deno/TypeScript para automatizar la gestión de assets (aplicaciones web) y certificados en **Check Point CloudGuard WAF SaaS / Infinity Next**:
+This repository contains two Deno/TypeScript scripts to automate the management of assets (web applications) and certificates in **Check Point CloudGuard WAF SaaS / Infinity Next**:
 
-- `deploy-assets-checkpoint-waf-saas.ts` — crea assets a partir de `assets.yaml`.
-- `upload-certificate-checkpoint-wafsaas.ts` — sube certificados propios (BYOC) a partir de `certificates.yaml`.
+- `deploy-assets-checkpoint-waf-saas.ts` — creates assets from `assets.yaml`.
+- `upload-certificate-checkpoint-wafsaas.ts` — uploads BYOC (Bring Your Own Cert) certificates from `certificates.yaml`.
 
-Ambos hablan con la API GraphQL del Infinity Portal (`/app/waf/graphql`) y usan las credenciales del fichero `.env`.
+Both speak the GraphQL API of the Infinity Portal (`/app/waf/graphql`) and consume credentials from the `.env` file.
 
-> **Nota sobre la API**: este código sigue el shape actual de la API verificado contra el portal. Las antiguas mutaciones `addSensitiveField`, `updateDomainCertificate` y `publishChanges` han sido reemplazadas por `createSaasCertificate`, `linkSaasCertificate` y `asyncPublishChanges` respectivamente. La colección Postman pública del repositorio `CheckPointSW/infinitynext-mgmt-api-resources` puede estar desactualizada.
+> **Note about the API**: this code follows the current API shape verified against the portal. The old mutations `addSensitiveField`, `updateDomainCertificate` and `publishChanges` have been replaced by `createSaasCertificate`, `linkSaasCertificate` and `asyncPublishChanges` respectively. The public Postman collection in `CheckPointSW/infinitynext-mgmt-api-resources` may be out of date.
 
 ---
 
-## Dependencias
+## Dependencies
 
 ```bash
-# Instalar Deno - https://docs.deno.com/runtime/getting_started/installation/
+# Install Deno - https://docs.deno.com/runtime/getting_started/installation/
 curl -fsSL https://deno.land/install.sh | sh
 
-# Instalar dotenvx - https://dotenvx.com/
+# Install dotenvx - https://dotenvx.com/
 curl -fsS https://dotenvx.sh | sudo sh
 
-# Reabrir terminal para refrescar el PATH
+# Reopen the terminal so the new PATH is picked up
 exit
 
-# Verificar versiones
+# Verify versions
 deno --version
 dotenvx --version
 ```
 
 ---
 
-## Resumen de los scripts
+## Scripts overview
 
 ### 1. `deploy-assets-checkpoint-waf-saas.ts`
 
-Despliega assets en el profile AppSecSaaS configurado. Para cada asset del YAML:
+Deploys assets to the configured AppSecSaaS profile. For each asset in the YAML:
 
-1. Comprueba si ya existe (`getWafAssets` con filtro `class: ["workload"]`). Si existe, lo salta.
-2. Pre-flight `validateName` para verificar que el nombre no choca con otros objetos.
-3. Crea el asset con `newAssetByWizard`, eligiendo entre cert propio (BYOC) o cert gestionado por el WAF según el flag `owncertificate` del YAML.
-4. **Al final del bucle**, ejecuta UNA sola vez `asyncPublishChanges` + `enforcePolicy` para publicar todos los assets nuevos en lote (optimización para grandes cargas).
+1. Checks whether it already exists (`getWafAssets` with the `class: ["workload"]` filter). If it exists, the asset is skipped.
+2. Pre-flights `validateName` to verify the name does not collide with another object.
+3. Creates the asset with `newAssetByWizard`, choosing between an own certificate (BYOC) or a WAF-managed certificate based on the `owncertificate` flag in the YAML.
+4. **At the end of the loop**, runs `asyncPublishChanges` + `enforcePolicy` ONCE to publish all the new assets in a single batch (large-load optimization).
 
-#### Funciones clave
+#### Key functions
 
-- `loadConfig(filename)` — carga y parsea un YAML.
-- `wafLogin(url, clientId, accessKey)` — autentica contra el Infinity Portal, devuelve el JWT.
-- `wafProfiles()` — resuelve el UUID del profile a partir de su nombre.
-- `getWafAssets(matchSearch)` — lista assets existentes (sustituye al antiguo `getAssets`).
-- `validateName(name)` — pre-flight de unicidad de nombre.
-- `newAssetByWizard(...)` — única función de creación, parametrizada por `ownCertificate: boolean`. Internamente envía `saasCertificateType: "BYOC"` o `"WAF_MANAGED"`.
-- `asyncPublishChanges()`, `enforcePolicy()`, `waitForTask(id)`, `publishAndEnforce()` — flujo de publicación.
-- `discardChanges()` — rollback si publish falla.
+- `loadConfig(filename)` — loads and parses a YAML file.
+- `wafLogin(url, clientId, accessKey)` — authenticates against the Infinity Portal and returns the JWT.
+- `wafProfiles()` — resolves the profile UUID from its name.
+- `getWafAssets(matchSearch)` — lists existing assets (replaces the old `getAssets`).
+- `validateName(name)` — name uniqueness pre-flight.
+- `newAssetByWizard(...)` — single creation function, parameterised with `ownCertificate: boolean`. Internally sends `saasCertificateType: "BYOC"` or `"WAF_MANAGED"`.
+- `asyncPublishChanges()`, `enforcePolicy()`, `waitForTask(id)`, `publishAndEnforce()` — publish flow.
+- `discardChanges()` — rollback if publish fails.
 
 ### 2. `upload-certificate-checkpoint-wafsaas.ts`
 
-Sube certificados propios (BYOC) y los enlaza a dominios de assets existentes. Para cada URL del YAML:
+Uploads BYOC certificates and links them to existing asset domains. For each URL in the YAML:
 
-1. Pide la public key RSA al backend (`getPublicKey`, `sensitiveFieldName: "nexusCertificate"`).
-2. Cifra la private key con un esquema híbrido **AES-CBC + RSA-OAEP** (la private key NUNCA viaja en claro).
-3. Crea el certificado como objeto de primer nivel con `createSaasCertificate` → recibe `certificateId`.
-4. Enlaza el certificado al dominio con `linkSaasCertificate(domain, certificateId)`.
-5. **Al final**, ejecuta UNA sola vez `asyncPublishChanges` + `enforcePolicy`.
+1. Asks the backend for the RSA public key (`getPublicKey`, `sensitiveFieldName: "nexusCertificate"`).
+2. Encrypts the private key with a hybrid scheme **AES-CBC + RSA-OAEP** (the private key NEVER travels in clear).
+3. Creates the certificate as a first-class object with `createSaasCertificate` → receives a `certificateId`.
+4. Links the certificate to the domain with `linkSaasCertificate(domain, certificateId)`.
+5. **At the end**, runs `asyncPublishChanges` + `enforcePolicy` ONCE.
 
-#### Funciones clave
+#### Key functions
 
-- `getEncryptionPublicKey(profileId, region)` — obtiene la public key del backend para cifrar.
-- `encryptPrivateKey(privateKey, publicKeyPem)` — cifrado híbrido AES + RSA.
-- `createSaasCertificate(...)` — crea el objeto certificado (sustituye al antiguo `addSensitiveField`).
-- `linkSaasCertificate(domain, certificateId)` — enlaza cert ↔ dominio (sustituye al antiguo `updateDomainCertificate`).
+- `getEncryptionPublicKey(profileId, region)` — fetches the backend public key used for encryption.
+- `encryptPrivateKey(privateKey, publicKeyPem)` — hybrid AES + RSA encryption.
+- `createSaasCertificate(...)` — creates the certificate object (replaces the old `addSensitiveField`).
+- `linkSaasCertificate(domain, certificateId)` — links cert ↔ domain (replaces the old `updateDomainCertificate`).
 
 ---
 
-## Ficheros de configuración
+## Configuration files
 
 ### 1. `.env`
 
-Credenciales y endpoint del Infinity Portal. **No subir nunca a git.**
+Credentials and endpoint of the Infinity Portal. **Never commit to git.**
 
 ```
 WAFKEY=<your_client_id>
@@ -83,11 +83,11 @@ WAFSECRET=<your_access_key>
 WAFAUTHURL=https://cloudinfra-gw.portal.checkpoint.com/auth/external
 ```
 
-Las credenciales se generan en *Infinity Portal → Global Settings → API Keys*, con servicio "Web Application & API Protection".
+Credentials are generated in *Infinity Portal → Global Settings → API Keys*, with service "Web Application & API Protection".
 
 ### 2. `assets.yaml`
 
-Define los assets que `deploy-assets-...` va a crear.
+Defines the assets that `deploy-assets-...` will create.
 
 ```yaml
 configuration:
@@ -101,20 +101,20 @@ assets:
     upstream: "<upstream_url>"
 ```
 
-- `profile` — nombre del profile AppSecSaaS (no el UUID; el script lo resuelve).
-- `region` — ej. `eu-west-1`.
-- `name` — nombre único del asset.
-- `domain` — una o varias URLs separadas por coma, cada una `https://...`.
+- `profile` — name of the AppSecSaaS profile (not the UUID; the script resolves it).
+- `region` — e.g. `eu-west-1`.
+- `name` — unique asset name.
+- `domain` — one or more URLs separated by comma, each `https://...`.
 - `owncertificate`:
-  - `true` → modo BYOC (Bring Your Own Cert). Hay que subir el cert luego con el otro script.
-  - `false` → cert gestionado por el WAF (auto-provisionado por Check Point).
-- `upstream` — URL del backend al que el WAF reenvía el tráfico.
+  - `true` → BYOC mode (Bring Your Own Cert). The certificate must be uploaded later with the other script.
+  - `false` → WAF-managed certificate (auto-provisioned by Check Point).
+- `upstream` — backend URL the WAF forwards traffic to.
 
-> **Sobre `WAF_MANAGED`**: el valor del enum para cert gestionado se ha asumido como `"WAF_MANAGED"` por convención. Si la API lo rechaza, ajustar la constante `SAAS_CERT_TYPE_WAF_MANAGED` al inicio del script (candidatos alternativos: `"AWS_MANAGED"`, `"AUTO"`, `"MANAGED"`).
+> **About `WAF_MANAGED`**: the enum value for the WAF-managed certificate has been assumed to be `"WAF_MANAGED"` by convention. If the API rejects it, adjust the constant `SAAS_CERT_TYPE_WAF_MANAGED` at the top of the script (alternative candidates: `"AWS_MANAGED"`, `"AUTO"`, `"MANAGED"`).
 
 ### 3. `certificates.yaml`
 
-Define los certificados que `upload-certificate-...` va a subir.
+Defines the certificates that `upload-certificate-...` will upload.
 
 ```yaml
 configuration:
@@ -128,58 +128,58 @@ urls:
     cert_key: "<path_to_privkey_pem>"
 ```
 
-- `cert_pem` — fichero PEM con la cadena completa (cert hoja + intermedios).
-- `cert_key` — private key PEM, **sin passphrase**.
+- `cert_pem` — PEM file with the full chain (leaf cert + intermediates).
+- `cert_key` — PEM private key, **without passphrase**.
 
 ---
 
-## Orden recomendado de ejecución
+## Recommended execution order
 
-1. Crear los assets con cert propio (BYOC):
+1. Create assets with own certificate (BYOC):
    ```bash
    dotenvx run -- deno run -A deploy-assets-checkpoint-waf-saas.ts
    ```
-2. Subir los certificados a los dominios recién creados:
+2. Upload certificates to the freshly created domains:
    ```bash
    dotenvx run -- deno run -A upload-certificate-checkpoint-wafsaas.ts
    ```
 
-Si todos los assets son `owncertificate: false` (gestionado por el WAF), basta con el primer paso.
+If every asset is `owncertificate: false` (managed by the WAF), only step 1 is needed.
 
-Cada ejecución genera un log con timestamp en el directorio actual:
+Each run produces a timestamped log in the current directory:
 
 - `YYYY-MM-DD-HH-MM_deploy-assets_output.log`
 - `YYYY-MM-DD-HH-MM_upload-certificates_output.log`
 
 ---
 
-## Optimización para grandes cargas
+## Large-load optimization
 
-Ambos scripts ejecutan `publishAndEnforce` **una sola vez al final del bucle**, no por cada elemento. Esto reduce drásticamente el tiempo total cuando se procesan decenas o cientos de assets/certificados, porque el flujo `publish + enforce + waitForTask` cuesta entre 30s y varios minutos por iteración. Los scripts también:
+Both scripts run `publishAndEnforce` **only once at the end of the loop**, not per element. This drastically reduces total runtime when processing tens or hundreds of assets/certificates, because the `publish + enforce + waitForTask` flow can take from 30 seconds to several minutes per iteration. The scripts also:
 
-- Saltan los assets que ya existen (`getWafAssets` + filtro por nombre).
-- Hacen pre-flight con `validateName` antes de crear.
-- Acumulan errores no fatales (cert que falla → log y siguiente) sin abortar todo el batch.
-
----
-
-## Seguridad
-
-- **Cifrado de la private key**: el certificado se sube con cifrado híbrido AES-CBC + RSA-OAEP. La private key se cifra con AES-256 y la AES key se cifra con la public key RSA del backend, generada por petición vía `getPublicKey`. Solo Check Point puede descifrar el bundle. La parte pública del certificado (PEM) viaja en claro porque no es secreta.
-- **No commitear** `.env`, `assets.yaml`, `certificates.yaml` ni los ficheros `.pem` con material sensible.
-- Permisos restrictivos en local: `chmod 600 .env *.pem`.
-- Rotar periódicamente las API keys del Infinity Portal.
+- Skip assets that already exist (`getWafAssets` + filter by name).
+- Pre-flight with `validateName` before creating.
+- Accumulate non-fatal errors (a failing cert → log and move on) without aborting the whole batch.
 
 ---
 
-## Notas sobre las llamadas GraphQL
+## Security
 
-| Operación               | Antigua                        | Actual                       |
-|-------------------------|--------------------------------|------------------------------|
-| Listar assets           | `getAssets` (`AssetsName`)     | `getWafAssets` (`WafAssetsName`, filtro `class:["workload"]`) |
-| Subir cert (encrypted)  | `addSensitiveField`            | `createSaasCertificate` (BYOC)  |
-| Enlazar cert → dominio  | `updateDomainCertificate`      | `linkSaasCertificate(domain, certificateId)` |
-| Publicar cambios        | `publishChanges` (síncrono)    | `asyncPublishChanges`        |
-| Aplicar política        | `enforcePolicy`                | `enforcePolicy` (sin cambios) |
-| Cifrado AES + RSA-OAEP  | igual                          | igual                        |
-| Pre-flight nombre       | —                              | `validateName(name, "Asset")` |
+- **Private key encryption**: certificates are uploaded with a hybrid AES-CBC + RSA-OAEP encryption. The private key is encrypted with AES-256, and the AES key is encrypted with the RSA public key the backend hands out via `getPublicKey`. Only Check Point can decrypt the bundle. The public part of the certificate (PEM) travels in clear because it is not a secret.
+- **Do not commit** `.env`, `assets.yaml`, `certificates.yaml`, or any `.pem` files containing sensitive material.
+- Restrictive permissions locally: `chmod 600 .env *.pem`.
+- Rotate the Infinity Portal API keys periodically.
+
+---
+
+## Notes about the GraphQL operations
+
+| Operation                  | Old                            | Current                       |
+|----------------------------|--------------------------------|-------------------------------|
+| List assets                | `getAssets` (`AssetsName`)     | `getWafAssets` (`WafAssetsName`, filter `class:["workload"]`) |
+| Upload cert (encrypted)    | `addSensitiveField`            | `createSaasCertificate` (BYOC) |
+| Link cert → domain         | `updateDomainCertificate`      | `linkSaasCertificate(domain, certificateId)` |
+| Publish changes            | `publishChanges` (sync)        | `asyncPublishChanges`         |
+| Enforce policy             | `enforcePolicy`                | `enforcePolicy` (unchanged)   |
+| AES + RSA-OAEP encryption  | same                           | same                          |
+| Name pre-flight            | —                              | `validateName(name, "Asset")` |
