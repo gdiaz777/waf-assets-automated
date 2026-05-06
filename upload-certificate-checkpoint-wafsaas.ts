@@ -198,11 +198,63 @@ async function getTask(taskid: string) {
     return null;
 }
 
-// Combines publish + enforce + wait for task.
+// Returns the list of sessions that have been published but not yet
+// enforced. Used to bridge asyncPublishChanges (which returns immediately
+// while validation runs in the background) and enforcePolicy (which only
+// takes effect once a published session is sitting in this list).
+async function getUnenforcedPublishedSessions(): Promise<any[]> {
+    const token = wafSession?.data?.token;
+    const headers = {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+    };
+    const body = {
+        operationName: "getUnenforcedPublishedSessions",
+        variables: {},
+        query: "query getUnenforcedPublishedSessions {\n  getUnenforcedPublishedSessions {\n    id\n    __typename\n  }\n}\n",
+    };
+    const response = await fetch(WAF_GRAPHQL_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+    });
+    if (response.ok) {
+        const data = await response.json();
+        return data?.data?.getUnenforcedPublishedSessions ?? [];
+    }
+    return [];
+}
+
+// Polls getUnenforcedPublishedSessions until at least one session is ready
+// to be enforced (or the timeout expires). Without this wait an enforce
+// fired right after asyncPublishChanges enforces the OLD state — leaving
+// fresh cert changes in the "Certificate issued. Enforce policy to proceed"
+// limbo we hit in the portal.
+async function waitForPublishedSession(maxAttempts = 30, intervalMs = 2000): Promise<boolean> {
+    for (let i = 0; i < maxAttempts; i++) {
+        const sessions = await getUnenforcedPublishedSessions();
+        if (sessions.length > 0) {
+            console.log(`Published session ready after ${i * intervalMs / 1000}s (${sessions.length} pending)`);
+            return true;
+        }
+        await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    console.warn("waitForPublishedSession timed out — nothing to enforce, or publish never settled");
+    return false;
+}
+
+// Combines publish + wait-for-publish + enforce + wait-for-task.
+//
+// IMPORTANT: enforcePolicy is ALWAYS called, even if waitForPublishedSession
+// times out. Empirically, certificate / asset changes can sit in a "needs
+// enforce" state that getUnenforcedPublishedSessions does not surface, so
+// the wait is just a timing hint to give validation a chance — never a gate.
 async function publishAndEnforce() {
     console.log("Publishing changes...");
     const publish = await asyncPublishChanges();
     console.log("Publish result:", publish);
+
+    await waitForPublishedSession();
 
     console.log("Enforcing policy...");
     const enforce = await enforcePolicy();
@@ -566,17 +618,17 @@ async function main() {
         console.log("--------- URL ", assetDataInput.ASSET_URL, "end ---------");
     }
 
-    // 4. Publish + enforce ONLY ONCE at the end, only if at least one
-    //    certificate was uploaded. Large-batch optimization: avoids N
-    //    unnecessary publish/enforce pairs when many certs are processed.
-    if (anySuccess) {
-        const ok = await publishAndEnforce();
-        if (!ok) {
-            console.error("Publish/enforce failed. Discarding changes...");
-            await discardChanges();
-        }
-    } else {
-        console.log("No certificates uploaded; skipping publish/enforce.");
+    // 4. Publish + enforce ONCE at the end. Run unconditionally so any
+    //    pending session left over from a previous failed run also gets
+    //    applied. publishAndEnforce is internally a no-op when there is
+    //    nothing to publish or enforce.
+    if (!anySuccess) {
+        console.log("No certificates uploaded in this run; checking for any pending published sessions to enforce anyway.");
+    }
+    const ok = await publishAndEnforce();
+    if (!ok) {
+        console.error("Publish/enforce failed. Discarding changes...");
+        await discardChanges();
     }
 }
 

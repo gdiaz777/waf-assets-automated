@@ -1,0 +1,20 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Certificates and private keys
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+
+# Run logs
+*_deploy-assets_output.log
+*_upload-certificates_output.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
