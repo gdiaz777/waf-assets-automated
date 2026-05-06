@@ -313,13 +313,62 @@ async function setHostHeader(assetId: string, hostHeader: string) {
     return null;
 }
 
-// Combines publish + enforce + waiting for the task. If publish fails,
-// discardChanges() is called to leave the tenant draft clean and avoid
-// contaminating future executions.
+// Returns the list of sessions that have been published but not yet enforced.
+// Used to bridge between asyncPublishChanges (which returns immediately while
+// validation runs in the background) and enforcePolicy (which only takes
+// effect once a published session is sitting in this list).
+async function getUnenforcedPublishedSessions(): Promise<any[]> {
+    const token = wafSession?.data?.token;
+    const headers = {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+    };
+    const body = {
+        operationName: "getUnenforcedPublishedSessions",
+        variables: {},
+        query: "query getUnenforcedPublishedSessions {\n  getUnenforcedPublishedSessions {\n    id\n    __typename\n  }\n}\n",
+    };
+    const response = await fetch(WAF_GRAPHQL_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+    });
+    if (response.ok) {
+        const data = await response.json();
+        return data?.data?.getUnenforcedPublishedSessions ?? [];
+    }
+    return [];
+}
+
+// Polls getUnenforcedPublishedSessions until at least one session is ready
+// to be enforced (or the timeout expires). Without this wait an enforce
+// fired right after asyncPublishChanges enforces the OLD state — leaving
+// fresh cert/asset changes in a "published but not enforced" limbo.
+async function waitForPublishedSession(maxAttempts = 30, intervalMs = 2000): Promise<boolean> {
+    for (let i = 0; i < maxAttempts; i++) {
+        const sessions = await getUnenforcedPublishedSessions();
+        if (sessions.length > 0) {
+            console.log(`Published session ready after ${i * intervalMs / 1000}s (${sessions.length} pending)`);
+            return true;
+        }
+        await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    console.warn("waitForPublishedSession timed out — nothing to enforce, or publish never settled");
+    return false;
+}
+
+// Combines publish + wait-for-publish + enforce + wait-for-task.
+//
+// IMPORTANT: enforcePolicy is ALWAYS called, even if waitForPublishedSession
+// times out. Empirically, certificate / asset changes can sit in a "needs
+// enforce" state that getUnenforcedPublishedSessions does not surface, so
+// the wait is just a timing hint to give validation a chance — never a gate.
 async function publishAndEnforce() {
     console.log("Publishing changes...");
     const publish = await asyncPublishChanges();
     console.log("Publish result:", publish);
+
+    await waitForPublishedSession();
 
     console.log("Enforcing policy...");
     const enforce = await enforcePolicy();
@@ -620,21 +669,22 @@ async function main() {
         console.log("--------- ASSET ", assetDataInput.ASSET_NAME, "end ---------");
     }
 
-    // 4. Publish + enforce ONLY ONCE at the end, only if anything was created.
-    //    This is the large-batch optimization: it avoids N unnecessary
-    //    publish/enforce pairs when many assets are processed.
+    // 4. Publish + enforce ONCE at the end. Run unconditionally so any
+    //    pending session left over from a previous failed run also gets
+    //    applied. publishAndEnforce is internally a no-op when there is
+    //    nothing to publish or enforce.
     if (createdCount > 0) {
         console.log(`========== Publishing ${createdCount} new asset(s) in a single batch ==========`);
-        const ok = await publishAndEnforce();
-        if (!ok) {
-            console.error("Publish/enforce failed. Discarding changes...");
-            await discardChanges();
-            await writeToFile(FILEPATH, `BATCH publish/enforce FAILED for ${createdCount} asset(s)\n`);
-        } else {
-            await writeToFile(FILEPATH, `BATCH publish/enforce OK for ${createdCount} asset(s)\n`);
-        }
     } else {
-        console.log("No new assets created; skipping publish/enforce.");
+        console.log("No new assets created; running publish/enforce anyway in case of pending sessions.");
+    }
+    const ok = await publishAndEnforce();
+    if (!ok) {
+        console.error("Publish/enforce failed. Discarding changes...");
+        await discardChanges();
+        await writeToFile(FILEPATH, `BATCH publish/enforce FAILED for ${createdCount} asset(s)\n`);
+    } else if (createdCount > 0) {
+        await writeToFile(FILEPATH, `BATCH publish/enforce OK for ${createdCount} asset(s)\n`);
     }
 }
 

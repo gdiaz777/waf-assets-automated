@@ -1,9 +1,10 @@
 # WAF SaaS Deployment and Certificate Upload Scripts
 
-This repository contains two Deno/TypeScript scripts to automate the management of assets (web applications) and certificates in **Check Point CloudGuard WAF SaaS / Infinity Next**:
+This repository contains three Deno/TypeScript scripts to automate the management of assets (web applications) and certificates in **Check Point CloudGuard WAF SaaS / Infinity Next**:
 
 - `deploy-assets-checkpoint-waf-saas.ts` — creates assets from `assets.yaml`.
 - `upload-certificate-checkpoint-wafsaas.ts` — uploads BYOC (Bring Your Own Cert) certificates from `certificates.yaml`.
+- `enforce-checkpoint-wafsaas.ts` — standalone publish + enforce helper, useful to apply pending changes left from a previous run (e.g. when the portal shows *"Certificate issued. Enforce policy to proceed."*).
 
 Both speak the GraphQL API of the Infinity Portal (`/app/waf/graphql`) and consume credentials from the `.env` file.
 
@@ -50,7 +51,7 @@ Deploys assets to the configured AppSecSaaS profile. For each asset in the YAML:
 - `validateName(name)` — name uniqueness pre-flight.
 - `newAssetByWizard(...)` — single creation function, parameterised with `ownCertificate: boolean`. Internally sends `saasCertificateType: "BYOC"` or `"CPManaged"`.
 - `setHostHeader(assetId, host)` — applies the optional Host header rewrite via `updateWebApplicationProxySetting` (only invoked when `host` is provided in the YAML).
-- `asyncPublishChanges()`, `enforcePolicy()`, `waitForTask(id)`, `publishAndEnforce()` — publish flow.
+- `asyncPublishChanges()`, `getUnenforcedPublishedSessions()`, `waitForPublishedSession()`, `enforcePolicy()`, `waitForTask(id)`, `publishAndEnforce()` — publish flow. `publishAndEnforce` ALWAYS calls `enforcePolicy` even when the wait for a published session times out, because cert/asset changes can need enforcement without showing up in `getUnenforcedPublishedSessions`.
 - `discardChanges()` — rollback if publish fails.
 
 ### 2. `upload-certificate-checkpoint-wafsaas.ts`
@@ -143,6 +144,10 @@ urls:
 2. Upload certificates to the freshly created domains:
    ```bash
    dotenvx run -- deno run -A upload-certificate-checkpoint-wafsaas.ts
+   ```
+3. *(Only if the portal still shows pending changes — usually not needed)* Force a publish + enforce:
+   ```bash
+   dotenvx run -- deno run -A enforce-checkpoint-wafsaas.ts
    ```
 
 If every asset is `owncertificate: false` (managed by the WAF), only step 1 is needed.
