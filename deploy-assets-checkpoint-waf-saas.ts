@@ -269,6 +269,49 @@ async function getTask(taskid: string) {
     return null;
 }
 
+// Adds a Host header rewrite to a Web Application asset. Used when the
+// upstream backend expects a different Host than the one the client used
+// (e.g. clients hit "shop.example.com" but the upstream LB only matches
+// "internal-shop.aws.example.com"). The portal stores this as two proxy
+// setting items: isSetHeader=true plus setHeader="Host:<value>".
+async function setHostHeader(assetId: string, hostHeader: string) {
+    const token = wafSession?.data?.token;
+    const headers = {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+    };
+    const body = {
+        operationName: "updateWebApplicationProxySetting",
+        variables: {
+            id: assetId,
+            addProxySettingItems: [
+                { key: "isSetHeader", value: "true" },
+                { key: "setHeader", value: `Host:${hostHeader}` },
+            ],
+            updateProxySettingItems: [],
+            removeProxySettingItems: [],
+        },
+        query: "mutation updateWebApplicationProxySetting($id: ID!, $addProxySettingItems: [WebApplicationProxySettingItemsInput], $removeProxySettingItems: [ID], $updateProxySettingItems: [WebApplicationProxySettingItemsUpdateInput]) {\n  updateWebApplicationProxySetting(\n    id: $id\n    addProxySettingItems: $addProxySettingItems\n    removeProxySettingItems: $removeProxySettingItems\n    updateProxySettingItems: $updateProxySettingItems\n  )\n}\n",
+    };
+    const response = await fetch(WAF_GRAPHQL_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+    });
+    if (response.ok) {
+        const data = await response.json();
+        if (data?.errors) {
+            console.error("setHostHeader returned errors:", data.errors);
+            return null;
+        }
+        console.log(`Host header set to "${hostHeader}" on asset ${assetId}`);
+        return data?.data?.updateWebApplicationProxySetting;
+    }
+    console.error("Failed to set host header");
+    console.error("Error data:", await response.json());
+    return null;
+}
+
 // Combines publish + enforce + waiting for the task. If publish fails,
 // discardChanges() is called to leave the tenant draft clean and avoid
 // contaminating future executions.
@@ -408,10 +451,12 @@ async function newAssetByWizard(assetData: {
 }
 
 // Creation wrapper: translates the YAML format into the object expected by
-// newAssetByWizard. Returns true if the asset was created (so main() can
-// decide whether to publish at the end), false if it failed or was skipped.
+// newAssetByWizard. After successful creation, applies the optional Host
+// header rewrite via setHostHeader. Returns true if the asset was created
+// (so main() can decide whether to publish at the end), false if it failed
+// or was skipped.
 async function createAsset(assetData: any): Promise<boolean> {
-    const { ASSET_DOMAIN, ASSET_NAME, ASSET_CERTIFICATE_TYPE, ASSET_UPSTREAM } = assetData;
+    const { ASSET_DOMAIN, ASSET_NAME, ASSET_CERTIFICATE_TYPE, ASSET_UPSTREAM, ASSET_HOST } = assetData;
 
     const ownCertificate = ASSET_CERTIFICATE_TYPE === true;
     if (ASSET_CERTIFICATE_TYPE !== true && ASSET_CERTIFICATE_TYPE !== false) {
@@ -442,7 +487,20 @@ async function createAsset(assetData: any): Promise<boolean> {
     }
 
     console.log("Asset created with ID:", asset.id);
-    await writeToFile(FILEPATH!, `Asset ${ASSET_NAME} created (id ${asset.id})\n`);
+
+    // Optional Host header rewrite. Only invoked when the YAML supplies a
+    // host value. A failure here does not undo the asset creation — the
+    // asset is logged as created and the host failure is logged separately.
+    if (ASSET_HOST) {
+        const headerResult = await setHostHeader(asset.id, ASSET_HOST);
+        if (headerResult === null) {
+            await writeToFile(FILEPATH!, `Asset ${ASSET_NAME} created but Host header FAILED\n`);
+        } else {
+            await writeToFile(FILEPATH!, `Asset ${ASSET_NAME} created (id ${asset.id}) with Host=${ASSET_HOST}\n`);
+        }
+    } else {
+        await writeToFile(FILEPATH!, `Asset ${ASSET_NAME} created (id ${asset.id})\n`);
+    }
     return true;
 }
 
