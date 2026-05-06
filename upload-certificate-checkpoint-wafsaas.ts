@@ -1,13 +1,33 @@
+// ============================================================================
+// upload-certificate-checkpoint-wafsaas.ts
+// ----------------------------------------------------------------------------
+// Sube certificados SSL/TLS propios (BYOC) a Check Point CloudGuard WAF SaaS /
+// Infinity Next y los enlaza a los dominios de assets que ya existen en el
+// profile.
+//
+// Modelo de seguridad: la private key NUNCA viaja en claro. Se cifra
+// localmente con AES-CBC; la clave AES se cifra con la public key RSA-OAEP
+// que entrega el backend (cifrado híbrido). Solo Check Point puede descifrar
+// con su private key, y solo entonces obtiene la AES key para abrir el blob.
+//
+// Optimización: publishAndEnforce se llama UNA SOLA VEZ al final, solo si al
+// menos un certificado se subió correctamente.
+// ============================================================================
+
 import { encode as encodeBase64 } from "https://deno.land/std@0.208.0/encoding/base64.ts";
 import { parse as parseYaml } from "jsr:@std/yaml";
 
-let wafSession = null
-let PROFILE = null
-let REGION = null
-let PROFILE_PID = null
-let FILEPATH = null
+// Endpoint GraphQL del Infinity Portal para WAF (la doble barra es real).
+const WAF_GRAPHQL_URL = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
 
-// Load the configuration file
+// Estado global del proceso. Se rellena en main() y se reusa en las funciones.
+let wafSession: any = null;     // Respuesta del login (contiene el JWT en data.token).
+let PROFILE: string | null = null;       // Nombre del profile AppSecSaaS objetivo.
+let REGION: string | null = null;        // Región del profile.
+let PROFILE_PID: string | null = null;   // UUID del profile.
+let FILEPATH: string | null = null;      // Ruta del log de salida con timestamp.
+
+// Carga y parsea un fichero YAML.
 async function loadConfig(filename: string) {
     const configText = await Deno.readTextFile(filename);
     try {
@@ -19,226 +39,169 @@ async function loadConfig(filename: string) {
     }
 }
 
-// Function to login to WAF
+// Login en el Infinity Portal. Devuelve el objeto que contiene el JWT.
 async function wafLogin(url: string, clientId: string, accessKey: string) {
     try {
         const response = await fetch(url, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ clientId, accessKey }),
         });
 
         if (response.ok) {
             console.log("Login successful");
-            const data = await response.json();
-            return data;
-        } else {
-            console.error("Login failed with status:", response.status);
-            const errorData = await response.json();
-            console.error("Error details:", errorData);
+            return await response.json();
         }
+        console.error("Login failed with status:", response.status);
+        console.error("Error details:", await response.json());
     } catch (error) {
         console.error("Error during WAF login:", error);
     }
-
     return null;
 }
-// WAF profile
+
+// Resuelve el UUID del profile a partir de su nombre (PROFILE).
 async function wafProfiles() {
-    const url = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
     const token = wafSession?.data?.token;
     const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
     };
     const body = {
-        "operationName": "ProfilesName",
-        "variables": {},
-        "query": "query ProfilesName($matchSearch: String, $filters: ProfileFilter, $paging: Paging, $sortBy: SortBy) {\n  getProfiles(\n    matchSearch: $matchSearch\n    filters: $filters\n    paging: $paging\n    sortBy: $sortBy\n  ) {\n    id\n    name\n    __typename\n  }\n}\n"
+        operationName: "ProfilesName",
+        variables: {},
+        query: "query ProfilesName($matchSearch: String, $filters: ProfileFilter, $paging: Paging, $sortBy: SortBy) {\n  getProfiles(\n    matchSearch: $matchSearch\n    filters: $filters\n    paging: $paging\n    sortBy: $sortBy\n  ) {\n    id\n    name\n    __typename\n  }\n}\n",
     };
     try {
-        const response = await fetch(url, {
+        const response = await fetch(WAF_GRAPHQL_URL, {
             method: "POST",
-            headers: headers,
+            headers,
             body: JSON.stringify(body),
         });
         if (response.ok) {
             const data = await response.json();
-            const profiles = data?.data?.getProfiles.map((profile: any) => ({
-                id: profile.id,
-                name: profile.name,
-            })) || [];
+            const profiles = data?.data?.getProfiles?.map((p: any) => ({ id: p.id, name: p.name })) ?? [];
             console.log("Profiles fetched successfully:", profiles);
-
-            if (profiles.length > 0) {
-                const matchingProfile = profiles.find((profile: any) => profile.name === PROFILE);
-                if (matchingProfile) {
-                    console.log(`Matching profile found: ${matchingProfile.name} with ID ${matchingProfile.id}`);
-                    return matchingProfile.id; // Return the id of the matching profile
-                } else {
-                    console.error(`No profile found with the name "${PROFILE}"`);
-                }
-            } else {
-                console.error("No profiles available.");
+            const match = profiles.find((p: any) => p.name === PROFILE);
+            if (match) {
+                console.log(`Matching profile found: ${match.name} with ID ${match.id}`);
+                return match.id;
             }
+            console.error(`No profile found with the name "${PROFILE}"`);
         } else {
             console.error("Failed to fetch profiles. Status:", response.status);
-            const errorData = await response.json();
-            console.error("Error details:", errorData);
+            console.error("Error details:", await response.json());
         }
     } catch (error) {
         console.error("Error during fetching profiles:", error);
     }
-
-    return null; 
+    return null;
 }
 
-//publish changes
-async function publishChanges() {
-    const url = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
+// Publica los cambios del tenant (asíncrono). Reemplaza al antiguo
+// publishChanges. La validación corre en background; la propagación al data
+// plane la dispara enforcePolicy.
+async function asyncPublishChanges() {
     const token = wafSession?.data?.token;
     const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
     };
     const body = {
-        "operationName": "publishChanges",
-        "variables": {
-            "profileTypes": [
-                "Docker",
-                "CloudGuardAppSecGateway",
-                "Embedded",
-                "Kubernetes",
-                "AppSecSaaS"
-            ]
+        operationName: "asyncPublishChanges",
+        variables: {
+            profileTypes: ["Docker", "CloudGuardAppSecGateway", "Embedded", "Kubernetes", "AppSecSaaS"],
         },
-        "query": "mutation publishChanges($profileTypes: [ProfileType!], $skipNginxValidation: Boolean) {\n  publishChanges(\n    profileTypes: $profileTypes\n    skipNginxValidation: $skipNginxValidation\n  ) {\n    isValid\n    errors {\n      message\n      __typename\n    }\n    warnings {\n      message\n      __typename\n    }\n    isNginxErrors\n    __typename\n  }\n}\n"
-
-    }
-
-    const response = await fetch(url, {
+        query: "mutation asyncPublishChanges($profileTypes: [ProfileType!], $skipNginxValidation: Boolean) {\n  asyncPublishChanges(\n    profileTypes: $profileTypes\n    skipNginxValidation: $skipNginxValidation\n  )\n}\n",
+    };
+    const response = await fetch(WAF_GRAPHQL_URL, {
         method: "POST",
-        headers: headers,
+        headers,
         body: JSON.stringify(body),
     });
     if (response.ok) {
-        console.log("Changes published successfully");
+        console.log("Changes published (async) successfully");
         const data = await response.json();
-        // console.log("data:", data);
-        return data?.data?.publishChanges;
-    } else {
-        console.error("Failed to publish changes");
-        const errorData = await response.json();
-        console.error("Error data:", errorData);
+        return data?.data?.asyncPublishChanges;
     }
-    return null
+    console.error("Failed to publish changes");
+    console.error("Error data:", await response.json());
+    return null;
 }
 
-//enforce policy
+// Aplica la política publicada a los enforcement points. Devuelve un task
+// asíncrono que se monitoriza con waitForTask().
 async function enforcePolicy() {
-    const url = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
     const token = wafSession?.data?.token;
     const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
     };
     const body = {
-        "operationName": "enforcePolicy",
-        "variables": {
-            "profileTypes": [
-                "Docker",
-                "CloudGuardAppSecGateway",
-                "Embedded",
-                "Kubernetes",
-                "AppSecSaaS"
-            ]
+        operationName: "enforcePolicy",
+        variables: {
+            profileTypes: ["Docker", "CloudGuardAppSecGateway", "Embedded", "Kubernetes", "AppSecSaaS"],
         },
-        "query": "mutation enforcePolicy($profilesIds: [ID!], $profileTypes: [ProfileType!]) {\n  enforcePolicy(profilesIds: $profilesIds, profileTypes: $profileTypes) {\n    id\n    tenantId\n    type\n    status\n    startTime\n    endTime\n    message\n    errorCode\n    referenceId\n    __typename\n  }\n}\n"
-    }
-    const response = await fetch(url, {
+        query: "mutation enforcePolicy($profilesIds: [ID!], $profileTypes: [ProfileType!]) {\n  enforcePolicy(profilesIds: $profilesIds, profileTypes: $profileTypes) {\n    id\n    tenantId\n    type\n    status\n    startTime\n    endTime\n    message\n    errorCode\n    referenceId\n    __typename\n  }\n}\n",
+    };
+    const response = await fetch(WAF_GRAPHQL_URL, {
         method: "POST",
-        headers: headers,
+        headers,
         body: JSON.stringify(body),
     });
     if (response.ok) {
         console.log("Policy enforced successfully");
         const data = await response.json();
-        // console.log("data:", data);
         return data?.data?.enforcePolicy;
-    } else {
-        console.error("Failed to enforce policy");
-        const errorData = await response.json();
-        console.error("Error data:", errorData);
     }
-    return null
+    console.error("Failed to enforce policy");
+    console.error("Error data:", await response.json());
+    return null;
 }
 
-//wait for task
+// Polling del estado del task con backoff fijo de 2s. Sale cuando el estado
+// deja de ser InProgress.
 async function waitForTask(taskId: string) {
     console.log("Waiting for taskId:", taskId);
     while (true) {
-        const task = await getTask(taskId!)
-        // console.log("task:", task);
-        const status = task?.status
+        const task = await getTask(taskId);
+        const status = task?.status;
         console.log("Task status:", status);
-        if (status !== "InProgress") {
-            // console.log("Task status:", status);
-            break;
-        }
-        // sleep for 2 seconds
+        if (status !== "InProgress") break;
         await new Promise((resolve) => setTimeout(resolve, 2000));
     }
-
 }
 
-//get task
+// Lee el estado de un task asíncrono por su id.
 async function getTask(taskid: string) {
-    const url = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
     const token = wafSession?.data?.token;
     const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
     };
     const body = {
-        "variables": {
-            "id": taskid
-        },
-        "query": "query getTask($id: ID!) {\n  getTask(id: $id) {\n    id\n    status\n    startTime\n  endTime\n   message\n    errorCode\n    referenceId\n    tenantId\n  }\n}\n"
-    }
-    const response = await fetch(url, {
+        variables: { id: taskid },
+        query: "query getTask($id: ID!) {\n  getTask(id: $id) {\n    id\n    status\n    startTime\n  endTime\n   message\n    errorCode\n    referenceId\n    tenantId\n  }\n}\n",
+    };
+    const response = await fetch(WAF_GRAPHQL_URL, {
         method: "POST",
-        headers: headers,
+        headers,
         body: JSON.stringify(body),
     });
     if (response.ok) {
-        console.log("Task fetched successfully");
         const data = await response.json();
-        // console.log("data:", data);
         return data?.data?.getTask;
     }
-    else {
-        console.error("Failed to fetch task");
-        const errorData = await response.json();
-        console.error("Error data:", errorData);
-    }
-    return null
+    console.error("Failed to fetch task");
+    console.error("Error data:", await response.json());
+    return null;
 }
 
-//publish and enforce
+// Combina publish + enforce + espera al task.
 async function publishAndEnforce() {
     console.log("Publishing changes...");
-    const publish = await publishChanges();
+    const publish = await asyncPublishChanges();
     console.log("Publish result:", publish);
-
-    // Check if publish is valid
-    if (publish?.isValid === false) {
-        console.error("Publish failed. Discarding changes...");
-        const discardResult = await discardChanges();
-        console.log("Discard changes result:", discardResult);
-        return false; // Exit the function if publish is invalid
-    }
 
     console.log("Enforcing policy...");
     const enforce = await enforcePolicy();
@@ -246,397 +209,373 @@ async function publishAndEnforce() {
 
     const taskId = enforce?.id;
     console.log("Task ID:", taskId);
-    if (taskId) {
-        await waitForTask(taskId);
-    }
+    if (taskId) await waitForTask(taskId);
     return true;
 }
 
-//get encryption public key
+// Pide al backend la public key RSA con la que cifrar la AES key local.
+// sensitiveFieldName "nexusCertificate" identifica el tipo de secreto que
+// vamos a subir; el backend devuelve la public key adecuada para ese campo.
 async function getEncryptionPublicKey(profileId: string, region: string) {
-    const url = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
     const token = wafSession?.data?.token;
     const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
     };
     const body = {
-        "operationName": "PublicKey",
-        "variables": {
-            "sensitiveFieldName": "nexusCertificate",
-            "profileId": profileId,
-            "region": region
+        operationName: "PublicKey",
+        variables: {
+            sensitiveFieldName: "nexusCertificate",
+            profileId,
+            region,
         },
-        "query": "query PublicKey($sensitiveFieldName: String!, $profileId: ID!, $region: String!) {\n  getPublicKey(\n    sensitiveFieldName: $sensitiveFieldName\n    profileId: $profileId\n    region: $region\n  )\n}\n"
-    }
-    const response = await fetch(url, {
+        query: "query PublicKey($sensitiveFieldName: String!, $profileId: ID!, $region: String!) {\n  getPublicKey(\n    sensitiveFieldName: $sensitiveFieldName\n    profileId: $profileId\n    region: $region\n  )\n}\n",
+    };
+    const response = await fetch(WAF_GRAPHQL_URL, {
         method: "POST",
-        headers: headers,
+        headers,
         body: JSON.stringify(body),
     });
     if (response.ok) {
         console.log("Public key fetched successfully");
         const data = await response.json();
-        // console.log("data:", data);
         return data?.data?.getPublicKey;
     }
-    else {
-        console.error("Failed to fetch public key");
-        const errorData = await response.json();
-        console.error("Error data:", errorData);
-    }
-    return null
+    console.error("Failed to fetch public key");
+    console.error("Error data:", await response.json());
+    return null;
 }
 
-//encrypt private key
+// Cifrado híbrido AES-CBC + RSA-OAEP. Los pasos son:
+//   1. Generar AES-256 key + IV de 16 bytes aleatorios (Web Crypto API).
+//   2. Cifrar la private key del cert con AES-CBC.
+//   3. Importar la public key del backend (formato SPKI/PEM).
+//   4. Cifrar la AES key con RSA-OAEP / SHA-256.
+//   5. Devolver dos blobs base64:
+//      - encryptedData = IV || ciphertext (AES)
+//      - encryptedKey  = AES key cifrada con RSA
+// Ambos blobs viajan al backend; solo Check Point puede descifrar el primero
+// porque solo ellos tienen la private key RSA emparejada.
 const encryptPrivateKey = async (privateKey: string, publicKeyPem: string) => {
     try {
-        // Generate random bytes for AES key and IV
+        // 1. Material aleatorio fresco para cada certificado.
         const aesKey = crypto.getRandomValues(new Uint8Array(32));
         const iv = crypto.getRandomValues(new Uint8Array(16));
 
-        // Create a buffer from the private key
         const privateKeyBuffer = new TextEncoder().encode(privateKey);
 
-        // Import the AES key
-        const aesCryptoKey = await crypto.subtle.importKey(
-            "raw",
-            aesKey,
-            "AES-CBC",
-            false,
-            ["encrypt"]
-        );
-
-        // Encrypt the private key using AES-CBC
+        // 2. AES-CBC sobre la private key.
+        const aesCryptoKey = await crypto.subtle.importKey("raw", aesKey, "AES-CBC", false, ["encrypt"]);
         const encryptedData = await crypto.subtle.encrypt(
-            {
-                name: "AES-CBC",
-                iv: iv,
-            },
+            { name: "AES-CBC", iv },
             aesCryptoKey,
-            privateKeyBuffer
+            privateKeyBuffer,
         );
 
         const encryptedDataBase64 = encodeBase64(new Uint8Array(encryptedData));
         const ivBase64 = encodeBase64(iv);
 
-
-        // Remove the PEM header and footer
+        // 3. Decodificar la public key PEM → SPKI binario.
+        //    Quitamos cabecera/pie y saltos de línea, base64-decode el cuerpo.
         const pemHeader = "-----BEGIN PUBLIC KEY-----";
         const pemFooter = "-----END PUBLIC KEY-----";
         const pemContents = publicKeyPem
             .replace(pemHeader, "")
             .replace(pemFooter, "")
-            .replace(/[\r\n]+/g, ""); // Remove newlines
+            .replace(/[\r\n]+/g, "");
 
-        // Decode the base64 content
-        const binaryDer = Uint8Array.from(atob(pemContents), c =>
-            c.charCodeAt(0)
-        );
+        const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
 
-        // Import the public key
+        // 4. Importar la public key como RSA-OAEP / SHA-256.
         const publicKey = await crypto.subtle.importKey(
             "spki",
             binaryDer,
-            {
-                name: "RSA-OAEP",
-                hash: "SHA-256",
-            },
+            { name: "RSA-OAEP", hash: "SHA-256" },
             false,
-            ["encrypt"]
+            ["encrypt"],
         );
 
-        // Encrypt the AES key using the provided public key (RSA-OAEP)
-        const encryptedAesKey = await crypto.subtle.encrypt(
-            {
-                name: "RSA-OAEP",
-            },
-            publicKey,
-            aesKey
-        );
-
+        // 5. Cifrar la AES key con RSA-OAEP.
+        const encryptedAesKey = await crypto.subtle.encrypt({ name: "RSA-OAEP" }, publicKey, aesKey);
         const encryptedKeyBase64 = encodeBase64(new Uint8Array(encryptedAesKey));
 
+        // El IV se concatena al inicio del ciphertext (convención esperada
+        // por el backend) en lugar de enviarse como campo aparte.
         return {
             encryptedData: ivBase64 + encryptedDataBase64,
             encryptedKey: encryptedKeyBase64,
         };
     } catch (error) {
         console.error(error);
-        return {
-            encryptedData: "",
-            encryptedKey: "",
-        };
+        return { encryptedData: "", encryptedKey: "" };
     }
 };
 
-//add sensitive field
-async function addSensitiveField(profileId: string, region: string, encryptedFieldValue: string, encryptedKey: string, cert: string) {
-    const url = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
-    const token = wafSession?.data?.token;
-    const headers = {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-    };
-    const body = {
-        "operationName": "addSensitiveField",
-        "variables": {
-            "sensitiveFieldName": "nexusCertificate",
-            "encryptedFieldValue": encryptedFieldValue,
-            "encryptedKey": encryptedKey,
-            "certificate": cert,
-            "profileId": profileId,
-            "region": region
-        },
-        "query": "mutation addSensitiveField($sensitiveFieldName: String!, $encryptedFieldValue: String!, $encryptedKey: String!, $certificate: String!, $profileId: ID!, $region: String!) {\n  addSensitiveField(\n    sensitiveFieldName: $sensitiveFieldName\n    encryptedFieldValue: $encryptedFieldValue\n    encryptedKey: $encryptedKey\n    certificate: $certificate\n    profileId: $profileId\n    region: $region\n  ) {\n    certificateARNForCloudfront\n    certificateArn\n    __typename\n  }\n}\n"
-    }
-    const response = await fetch(url, {
-        method: "POST",
-        headers: headers,
-        body: JSON.stringify(body),
-    });
-    if (response.ok) {
-        console.log("Sensitive field added successfully");
-        const data = await response.json();
-        // console.log("data:", data);
-        return data?.data?.addSensitiveField;
-    }
-    else {
-        console.error("Failed to add sensitive field");
-        const errorData = await response.json();
-        console.error("Error data:", errorData);
-    }
-    return null
+// Genera el sufijo de timestamp con el formato que usa el portal para los
+// nombres de fichero del cert/key (ej. "06-May-2026_18:30:42").
+function portalTimestamp(): string {
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const d = new Date();
+    const dd = String(d.getDate()).padStart(2, "0");
+    const mmm = months[d.getMonth()];
+    const yyyy = d.getFullYear();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${dd}-${mmm}-${yyyy}_${hh}:${mi}:${ss}`;
 }
 
-//get profile
-async function getProfile(profileId: string) {
-    const url = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
+// Crea un certificado SaaS BYOC (Bring Your Own Cert) como objeto de primer
+// nivel en la plataforma. Reemplaza al antiguo addSensitiveField + payload de
+// updateDomainCertificate. Devuelve el certificateId del certificado creado.
+//
+// Notas sobre el input:
+//   - certificateType "BYOC"  → cert propio (no AWS-managed).
+//   - encryptedFieldValue/Key → blobs del cifrado híbrido (encryptPrivateKey).
+//   - certificate              → fullchain PEM EN CLARO (la parte pública no es secreta).
+//   - certificateFile          → mismo PEM en data URL base64 (el portal lo usa
+//                                para mostrar/descargar el fichero).
+//   - regions: array — permite multi-región para un mismo cert.
+//   - domain: el cert nace ya asociado a este dominio; el link se hace luego.
+async function createSaasCertificate(
+    profileId: string,
+    region: string,
+    domain: string,
+    encryptedFieldValue: string,
+    encryptedKey: string,
+    cert: string,
+) {
     const token = wafSession?.data?.token;
     const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
     };
+    const ts = portalTimestamp();
+    const certB64 = btoa(cert);
     const body = {
-        "operationName": "Profile",
-        "variables": {
-            "id": profileId
-        },
-        "query": "query Profile($id: ID!) {\n  getProfile(id: $id) {\n    id\n    name\n    profileType\n    status\n    additionalSettings {\n      id\n      key\n      value\n      __typename\n    }\n    tags {\n      id\n      tag\n      __typename\n    }\n    latestEnforcedPolicy {\n      timestamp\n      version\n      __typename\n    }\n    objectStatus\n    numberOfAgents\n    numberOfOutdatedAgents\n    usedBy {\n      id\n      name\n      subType\n      __typename\n    }\n    ... on KubernetesProfile {\n      profileSubType\n      maxNumberOfAgents\n      authentication {\n        authenticationType\n        tokens {\n          token\n          id\n          expirationTime\n          __typename\n        }\n        __typename\n      }\n      upgradeMode\n      upgradeTime {\n        duration\n        time\n        scheduleType\n        ... on ScheduleDaysInMonth {\n          days\n          __typename\n        }\n        ... on ScheduleDaysInWeek {\n          weekDays\n          __typename\n        }\n        __typename\n      }\n      onlyDefinedApplications\n      failOpenInspection\n      managerInfo {\n        managerId\n        managerName\n        __typename\n      }\n      profileManagedBy\n      __typename\n    }\n    ... on VirtualNSaaSProfile {\n      cloudVendor\n      cloudAccounts {\n        id\n        accountId\n        accountRegions {\n          id\n          regionName\n          vpcEndpointService\n          __typename\n        }\n        __typename\n      }\n      managerInfo {\n        managerId\n        managerName\n        __typename\n      }\n      ARNOutboundCertificate\n      __typename\n    }\n    ... on AppSecSaaSProfile {\n      region\n      maxNumberOfAgents\n      failOpenInspection\n      certificateDomains {\n        id\n        domain\n        certificateParameter {\n          id\n          ... on CertificateParameter {\n            isCPManaged\n            certificateFile {\n              id\n              name\n              __typename\n            }\n            keyName\n            certificateFileName\n            certificateExpirationDate\n            certificateARN\n            certificateARNForCloudfront\n            __typename\n          }\n          __typename\n        }\n        cnameName\n        cnameValue\n        certificateValidationStatus\n        validationInfo\n        __typename\n      }\n      usedByType {\n        assets {\n          id\n          name\n          ... on WebApplicationAsset {\n            URLs {\n              id\n              URL\n              __typename\n            }\n            upstreamURL\n            __typename\n          }\n          __typename\n        }\n        __typename\n      }\n      __typename\n    }\n    ... on EmbeddedProfile {\n      profileSubType\n      maxNumberOfAgents\n      authentication {\n        authenticationType\n        tokens {\n          token\n          id\n          expirationTime\n          __typename\n        }\n        __typename\n      }\n      upgradeMode\n      upgradeTime {\n        duration\n        time\n        scheduleType\n        ... on ScheduleDaysInMonth {\n          days\n          __typename\n        }\n        ... on ScheduleDaysInWeek {\n          weekDays\n          __typename\n        }\n        __typename\n      }\n      failOpenInspection\n      onlyDefinedApplications\n      profileManagedBy\n      managedByNginx\n      __typename\n    }\n    ... on QuantumProfile {\n      cloudId\n      maxNumberOfAgents\n      numberOfAgents\n      authentication {\n        authenticationType\n        tokens {\n          token\n          id\n          expirationTime\n          __typename\n        }\n        __typename\n      }\n      upgradeMode\n      upgradeTime {\n        duration\n        time\n        scheduleType\n        ... on ScheduleDaysInMonth {\n          days\n          __typename\n        }\n        ... on ScheduleDaysInWeek {\n          weekDays\n          __typename\n        }\n        __typename\n      }\n      __typename\n    }\n    ... on DockerProfile {\n      profileSubType\n      maxNumberOfAgents\n      vendor\n      isSelfManaged\n      authentication {\n        authenticationType\n        tokens {\n          token\n          id\n          expirationTime\n          __typename\n        }\n        __typename\n      }\n      upgradeMode\n      upgradeTime {\n        duration\n        time\n        scheduleType\n        ... on ScheduleDaysInMonth {\n          days\n          __typename\n        }\n        ... on ScheduleDaysInWeek {\n          weekDays\n          __typename\n        }\n        __typename\n      }\n      onlyDefinedApplications\n      failOpenInspection\n      managerInfo {\n        managerId\n        managerName\n        __typename\n      }\n      profileManagedBy\n      managedByNginx\n      __typename\n    }\n    ... on CloudNativeProfile {\n      maxNumberOfAgents\n      authentication {\n        authenticationType\n        tokens {\n          token\n          id\n          expirationTime\n          __typename\n        }\n        __typename\n      }\n      upgradeMode\n      upgradeTime {\n        duration\n        time\n        scheduleType\n        ... on ScheduleDaysInMonth {\n          days\n          __typename\n        }\n        ... on ScheduleDaysInWeek {\n          weekDays\n          __typename\n        }\n        __typename\n      }\n      onlyDefinedApplications\n      __typename\n    }\n    ... on CloudGuardAppSecGatewayProfile {\n      profileSubType\n      certificateType\n      maxNumberOfAgents\n      authentication {\n        authenticationType\n        tokens {\n          token\n          id\n          expirationTime\n          __typename\n        }\n        __typename\n      }\n      upgradeMode\n      upgradeTime {\n        duration\n        time\n        scheduleType\n        ... on ScheduleDaysInMonth {\n          days\n          __typename\n        }\n        ... on ScheduleDaysInWeek {\n          weekDays\n          __typename\n        }\n        __typename\n      }\n      usedByType {\n        assets {\n          id\n          name\n          assetType\n          class\n          category\n          family\n          group\n          order\n          kind\n          tags {\n            id\n            tag\n            __typename\n          }\n          ... on WebApplicationAsset {\n            URLs {\n              id\n              URL\n              __typename\n            }\n            upstreamURL\n            __typename\n          }\n          __typename\n        }\n        __typename\n      }\n      reverseProxyUpstreamTimeout\n      reverseProxyAdditionalSettings {\n        key\n        value\n        __typename\n      }\n      failOpenInspection\n      __typename\n    }\n    ... on IotEnforcementProfile {\n      policyPackagesWithIotLayer {\n        id\n        name\n        type\n        subType\n        __typename\n      }\n      enforceIotLayerOnGateways {\n        id\n        name\n        type\n        subType\n        __typename\n      }\n      enforceIotLayerOnAllGateways\n      installPolicyOnEnforce\n      __typename\n    }\n    ... on IotConfigurationVirtualProfile {\n      iotState\n      shouldEnforceBetaRules\n      configurationsSettings {\n        id\n        key\n        value\n        __typename\n      }\n      __typename\n    }\n    ... on IotConfigurationProfile {\n      iotState\n      shouldEnforceBetaRules\n      configurationsSettings {\n        id\n        key\n        value\n        __typename\n      }\n      __typename\n    }\n    ... on IotBuiltinDiscoveryProfile {\n      numberOfLogicalAgents\n      additionalSettings {\n        id\n        key\n        value\n        __typename\n      }\n      integrationType\n      arguments\n      dnsProbing\n      mdnsProbing\n      upnpProbing\n      snmpProbing\n      sshProbing\n      httpProbing\n      telnetProbing\n      ftpProbing\n      matchQuery\n      installDiscoveryOnMgmt\n      installDiscoveryOnAllGateWays\n      installDiscoveryOn {\n        id\n        name\n        type\n        subType\n        __typename\n      }\n      enforceAssetsOnPolicyPackages {\n        id\n        name\n        type\n        subType\n        __typename\n      }\n      sendAssetsToGateways\n      __typename\n    }\n    ... on IotRiskProfile {\n      numberOfLogicalAgents\n      matchQuery\n      overrideSettings\n      configurationSettings\n      installDiscoveryOnMgmt\n      installDiscoveryOnAllGateWays\n      installDiscoveryOn {\n        id\n        name\n        type\n        subType\n        __typename\n      }\n      runActiveNmapProbing\n      __typename\n    }\n    ... on SdWanProfile {\n      matchQuery\n      SdWanGateways {\n        id\n        name\n        objectStatus\n        __typename\n      }\n      numberOfAgents\n      __typename\n    }\n    ... on IoTEmbeddedProfile {\n      maxNumberOfAgents\n      authentication {\n        authenticationType\n        tokens {\n          token\n          id\n          expirationTime\n          __typename\n        }\n        __typename\n      }\n      upgradeMode\n      upgradeTime {\n        duration\n        time\n        scheduleType\n        ... on ScheduleDaysInMonth {\n          days\n          __typename\n        }\n        ... on ScheduleDaysInWeek {\n          weekDays\n          __typename\n        }\n        __typename\n      }\n      failOpenInspection\n      onlyDefinedApplications\n      profileManagedBy\n      __typename\n    }\n    __typename\n  }\n}\n",
-    };
-    const response = await fetch(url, {
-        method: "POST",
-        headers: headers,
-        body: JSON.stringify(body),
-    });
-    if (response.ok) {
-        console.log("Profile fetched successfully");
-        const data = await response.json();
-        //console.log("data:", data);
-        return data?.data?.getProfile;
-    } else {
-        console.error("Failed to fetch profile");
-        const errorData = await response.json();
-        console.error("Error data:", errorData);
-    }
-    return null
-}
-
-//updaate certificate
-async function updateCertificate(uri, certificateARNForCloudfront, certificateARN, certId, certPem) {
-    const url = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
-    const token = wafSession?.data?.token;
-    const headers = {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-    };
-    const certPemB64 = btoa(certPem);
-    const body = {
-        "operationName": "updateDomainCertificate",
-        "variables": {
-            "id": certId,
-            "parameterInput": {
-                "certificateARNForCloudfront": certificateARNForCloudfront,
-                "certificateARN": certificateARN,
-                "keyName": `${uri}-${Date.now()}.key.pem`,
-                "certificateFile": `data:application/octet-stream;base64,${certPemB64}`,
-                "certificateFileName": `${uri}-${Date.now()}.crt.pem`,
-                "isCPManaged": false,
-                "uri": uri
+        operationName: "createSaasCertificate",
+        variables: {
+            certificateInput: {
+                certificateType: "BYOC",
+                encryptedFieldValue,
+                encryptedKey,
+                certificate: cert,
+                certificateFile: `data:application/octet-stream;base64,${certB64}`,
+                certFileName: `fullchain.pem_${ts}`,
+                keyFileName: `privkey.pem_${ts}`,
+                sensitiveFieldName: "nexusCertificate",
+                profileId,
+                regions: [region],
+                domain,
             },
         },
-        "query": "mutation updateDomainCertificate($parameterInput: CertificateUpdateInput, $id: ID!) {\n  updateDomainCertificate(parameterInput: $parameterInput, id: $id)\n}\n"
-    }
-    const response = await fetch(url, {
+        query: "mutation createSaasCertificate($certificateInput: CreateCertificateInput!) {\n  createSaasCertificate(certificateInput: $certificateInput) {\n    certificateId\n    __typename\n  }\n}\n",
+    };
+    const response = await fetch(WAF_GRAPHQL_URL, {
         method: "POST",
-        headers: headers,
+        headers,
         body: JSON.stringify(body),
     });
     if (response.ok) {
-        console.log("Certificate updated successfully");
         const data = await response.json();
-        // console.log("data:", data);
-        return data?.data?.updateDomainCertificate;
+        // La API GraphQL puede devolver 200 OK con errores en data.errors.
+        if (data?.errors) {
+            console.error("createSaasCertificate returned errors:", data.errors);
+            return null;
+        }
+        const certificateId = data?.data?.createSaasCertificate?.certificateId;
+        console.log("SaaS certificate created. certificateId:", certificateId);
+        return certificateId;
     }
-    else {
-        console.error("Failed to update certificate");
-        const errorData = await response.json();
-        console.error("Error data:", errorData);
-    }
-    return null
-
+    console.error("Failed to create SaaS certificate");
+    console.error("Error data:", await response.json());
+    return null;
 }
 
-//discard changes
-
-async function discardChanges(): Promise<any> {
-    const url = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
-    const token = wafSession?.data?.token; // Ensure wafSession is initialized
+// Enlaza un certificado existente a un dominio. Reemplaza al antiguo
+// updateDomainCertificate. La API moderna trabaja con dos identificadores
+// simples (domain + certificateId) en lugar del antiguo certificateParameter.id.
+// Esto permite que un mismo certificado (wildcard/SAN) se pueda enlazar a
+// varios dominios sin reuploads.
+async function linkSaasCertificate(domain: string, certificateId: string) {
+    const token = wafSession?.data?.token;
     const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
     };
-
     const body = {
-        "operationName": "discardChanges",
-        "variables": {},
-        "query": "mutation discardChanges {\n  discardChanges\n}\n"
+        operationName: "linkSaasCertificate",
+        variables: { domain, certificateId },
+        query: "mutation linkSaasCertificate($domain: String!, $certificateId: ID!) {\n  linkSaasCertificate(domain: $domain, certificateId: $certificateId)\n}\n",
     };
+    const response = await fetch(WAF_GRAPHQL_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+    });
+    if (response.ok) {
+        const data = await response.json();
+        if (data?.errors) {
+            console.error("linkSaasCertificate returned errors:", data.errors);
+            return null;
+        }
+        console.log(`Certificate ${certificateId} linked to domain ${domain}`);
+        return data?.data?.linkSaasCertificate;
+    }
+    console.error("Failed to link SaaS certificate");
+    console.error("Error data:", await response.json());
+    return null;
+}
 
+// Descarta el draft del tenant. Rollback si publish falla.
+async function discardChanges(): Promise<any> {
+    const token = wafSession?.data?.token;
+    const headers = {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+    };
+    const body = {
+        operationName: "discardChanges",
+        variables: {},
+        query: "mutation discardChanges {\n  discardChanges\n}\n",
+    };
     try {
-        const response = await fetch(url, {
+        const response = await fetch(WAF_GRAPHQL_URL, {
             method: "POST",
-            headers: headers,
+            headers,
             body: JSON.stringify(body),
         });
-
         if (response.ok) {
             console.log("Changes discarded successfully");
             const data = await response.json();
             return data?.data?.discardChanges;
-        } else {
-            console.error("Failed to discard changes");
-            const errorData = await response.json();
-            console.error("Error data:", errorData);
         }
+        console.error("Failed to discard changes");
+        console.error("Error data:", await response.json());
     } catch (error) {
         console.error("Error discarding changes:", error);
     }
-
     return null;
 }
 
-//write log
+// Append a fichero de log (errores se ignoran para no romper el flujo).
 async function writeToFile(filePath: string, input: string) {
     try {
-        await Deno.writeTextFile(filePath, input, { append: true }); // Append to the file
-    } catch (error) {
-    }
+        await Deno.writeTextFile(filePath, input, { append: true });
+    } catch (_error) { /* ignore */ }
 }
 
 async function main() {
-   
-    // Create output file
+    // Log con timestamp en el directorio actual.
     const now = new Date();
     const formattedDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}`;
-    FILEPATH = `./${formattedDate}_upload-certificates_output.log`; // File path with the formatted date
-        
-    const config = await loadConfig("certificates.yaml");
-    console.log("config:", JSON.stringify(config, null, 2));
-    
-    //Load Profile and Region.
-     PROFILE = config.configuration.profile;
-     REGION = config.configuration.region;
-     console.log("Profile and Region loaded:", PROFILE, REGION);
+    FILEPATH = `./${formattedDate}_upload-certificates_output.log`;
 
-    //Load WAF credentials.
+    // 1. Cargar configuración (certificates.yaml) y credenciales (.env).
+    const config: any = await loadConfig("certificates.yaml");
+    console.log("config:", JSON.stringify(config, null, 2));
+
+    PROFILE = config.configuration.profile;
+    REGION = config.configuration.region;
+    console.log("Profile and Region loaded:", PROFILE, REGION);
+
     const url = Deno.env.get("WAFAUTHURL")!;
     const clientId = Deno.env.get("WAFKEY")!;
     const accessKey = Deno.env.get("WAFSECRET")!;
-    
-    //Login WAF and save the session into wafSession variable.
+
+    // 2. Login + resolver UUID del profile.
     wafSession = await wafLogin(url, clientId, accessKey);
     if (!wafSession) {
         console.error("Failed to login to WAF");
         return;
     }
 
-    // Get the WAF profile ID
     PROFILE_PID = await wafProfiles();
     if (!PROFILE_PID) {
         console.error("Failed to get WAF profile ID");
         return;
     }
 
-    //Load assets configuration.
-     if (config?.urls) {
-        // Loop through each asset in the configuration
-        for (const asset of config.urls) {
-            const assetDataInput = {
-                ASSET_URL: asset.url,
-                ASSET_DOMAIN: asset.domain,
-                ASSET_CERT_PEM: asset.cert_pem,
-                ASSET_CERT_KEY: asset.cert_key
-            };     
-            console.log("--------- URL ", assetDataInput.ASSET_URL ,"started ---------");
-            const profile = await getProfile(PROFILE_PID)
-            const certificateDomainList = profile.certificateDomains?.map((domainObj: any) => ({
-                domain: domainObj.domain,
-                id: domainObj.certificateParameter?.id,
-            }));
-            const updatedCertificateDomainList = certificateDomainList.map((item: any) => ({
-                ...item,
-                domain: `https://${item.domain}`, // Add "https://" to the beginning of the domain
-            }));
-            //console.log("Updated certificate domain list:", updatedCertificateDomainList);
-            
-            const certificateDomainParematerIdNAME = updatedCertificateDomainList.find((item: any) => item.domain === assetDataInput.ASSET_URL);
-            const certificateDomainParematerId = certificateDomainParematerIdNAME?.id;
-            console.log("certificateDomainParematerId:", certificateDomainParematerId);
-               if (certificateDomainParematerId) {
-                const publicKey = await getEncryptionPublicKey(PROFILE_PID, REGION)
-                // console.log("Public key:", publicKey);
-                 const keyFile = assetDataInput.ASSET_CERT_KEY
-                 const key = await Deno.readTextFile(keyFile)
-                 const certFile = assetDataInput.ASSET_CERT_PEM 
-                 const cert = await Deno.readTextFile(certFile)
-                 //console.log("key:", key);
-                 //console.log("cert:", cert);
-                 const result = await encryptPrivateKey(key, publicKey);
-                 console.log("Encrypted public key and private key")
-                 //console.log(result);
-                 const addSensitiveFieldRes = await addSensitiveField(
-                     PROFILE_PID,
-                     REGION,
-                     result.encryptedData,
-                     result.encryptedKey,
-                     cert
-                 );
-                   console.log("Uploading certificate for domain:", assetDataInput.ASSET_URL);
-                   const certUpdate = await updateCertificate(
-                   assetDataInput.ASSET_DOMAIN,
-                   addSensitiveFieldRes?.certificateARNForCloudfront,
-                   addSensitiveFieldRes?.certificateArn,
-                   certificateDomainParematerId,
-                   cert
-                   )
-                   await writeToFile(FILEPATH, `Certificate uploaded successfully ${assetDataInput.ASSET_URL} \n`);
-                   await publishAndEnforce();
-               }else{
-                await writeToFile(FILEPATH, `Certificate uploaded failed ${assetDataInput.ASSET_URL} \n`);
-                console.log("Failed to upload certificate for domain:", assetDataInput.ASSET_URL, "URL not found in the profile");
-               }
-              console.log("--------- URL ", assetDataInput.ASSET_URL ,"end ---------");
+    if (!config?.urls) return;
+
+    // 3. Bucle por cada URL — solo crear+enlazar el certificado, sin publicar
+    //    aún. Usamos el flag anySuccess para decidir si vale la pena el
+    //    publish/enforce final (optimización para grandes cargas).
+    let anySuccess = false;
+
+    for (const asset of config.urls) {
+        const assetDataInput = {
+            ASSET_URL: asset.url,
+            ASSET_DOMAIN: asset.domain,
+            ASSET_CERT_PEM: asset.cert_pem,
+            ASSET_CERT_KEY: asset.cert_key,
+        };
+        console.log("--------- URL ", assetDataInput.ASSET_URL, "started ---------");
+
+        // 3a. Pedir public key fresca por cada cert (es barato y permite
+        //     que el backend rote sin rompernos).
+        const publicKey = await getEncryptionPublicKey(PROFILE_PID!, REGION!);
+        if (!publicKey) {
+            await writeToFile(FILEPATH, `Certificate upload failed (no public key) ${assetDataInput.ASSET_URL}\n`);
+            continue;
         }
+
+        // 3b. Leer cert + key del disco. La key debe estar SIN passphrase y
+        //     el cert debe ser fullchain (cert hoja + intermedios).
+        const key = await Deno.readTextFile(assetDataInput.ASSET_CERT_KEY);
+        const cert = await Deno.readTextFile(assetDataInput.ASSET_CERT_PEM);
+
+        // 3c. Cifrar la private key (híbrido AES + RSA).
+        const encrypted = await encryptPrivateKey(key, publicKey);
+        if (!encrypted.encryptedData || !encrypted.encryptedKey) {
+            await writeToFile(FILEPATH, `Certificate upload failed (encryption error) ${assetDataInput.ASSET_URL}\n`);
+            continue;
+        }
+        console.log("Encrypted public key and private key");
+
+        // 3d. Crear el objeto certificado en la plataforma.
+        const certificateId = await createSaasCertificate(
+            PROFILE_PID!,
+            REGION!,
+            assetDataInput.ASSET_DOMAIN,
+            encrypted.encryptedData,
+            encrypted.encryptedKey,
+            cert,
+        );
+
+        if (!certificateId) {
+            await writeToFile(FILEPATH, `Certificate upload failed (createSaasCertificate) ${assetDataInput.ASSET_URL}\n`);
+            console.log("--------- URL ", assetDataInput.ASSET_URL, "end ---------");
+            continue;
+        }
+
+        // 3e. Enlazar el certificado al dominio del asset.
+        const linkResult = await linkSaasCertificate(assetDataInput.ASSET_DOMAIN, certificateId);
+        if (linkResult === null) {
+            await writeToFile(FILEPATH, `Certificate uploaded but link failed ${assetDataInput.ASSET_URL}\n`);
+            console.log("--------- URL ", assetDataInput.ASSET_URL, "end ---------");
+            continue;
+        }
+
+        await writeToFile(FILEPATH, `Certificate uploaded successfully ${assetDataInput.ASSET_URL}\n`);
+        anySuccess = true;
+        console.log("--------- URL ", assetDataInput.ASSET_URL, "end ---------");
     }
-    return;
+
+    // 4. Publish + enforce UNA SOLA VEZ al final, solo si subimos al menos un
+    //    certificado. Optimización para cargas grandes: evitamos N pares de
+    //    publish/enforce innecesarios cuando se procesan muchos certs.
+    if (anySuccess) {
+        const ok = await publishAndEnforce();
+        if (!ok) {
+            console.error("Publish/enforce failed. Discarding changes...");
+            await discardChanges();
+        }
+    } else {
+        console.log("No certificates uploaded; skipping publish/enforce.");
+    }
 }
 
-
 main()
-    .then(() => {
-        console.log("done");
-    })
-    .catch((error) => {
-        console.error("Error:", error);
-    });
+    .then(() => console.log("done"))
+    .catch((error) => console.error("Error:", error));
