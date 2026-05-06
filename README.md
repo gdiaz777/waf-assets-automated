@@ -49,6 +49,7 @@ Deploys assets to the configured AppSecSaaS profile. For each asset in the YAML:
 - `getWafAssets(matchSearch)` — lists existing assets (replaces the old `getAssets`).
 - `validateName(name)` — name uniqueness pre-flight.
 - `newAssetByWizard(...)` — single creation function, parameterised with `ownCertificate: boolean`. Internally sends `saasCertificateType: "BYOC"` or `"WAF_MANAGED"`.
+- `setHostHeader(assetId, host)` — applies the optional Host header rewrite via `updateWebApplicationProxySetting` (only invoked when `host` is provided in the YAML).
 - `asyncPublishChanges()`, `enforcePolicy()`, `waitForTask(id)`, `publishAndEnforce()` — publish flow.
 - `discardChanges()` — rollback if publish fails.
 
@@ -99,6 +100,7 @@ assets:
     domain: "<https_url1, https_url2, ...>"
     owncertificate: <true|false>
     upstream: "<upstream_url>"
+    host: "<optional_host_header>"
 ```
 
 - `profile` — name of the AppSecSaaS profile (not the UUID; the script resolves it).
@@ -109,6 +111,7 @@ assets:
   - `true` → BYOC mode (Bring Your Own Cert). The certificate must be uploaded later with the other script.
   - `false` → WAF-managed certificate (auto-provisioned by Check Point).
 - `upstream` — backend URL the WAF forwards traffic to.
+- `host` *(optional)* — Host header value sent to the upstream. Useful when the upstream LB does virtual-host routing on a different hostname than the public domain (e.g. AWS ELB routing on the internal hostname). When set, the script applies it via `updateWebApplicationProxySetting` after the asset is created.
 
 > **About `WAF_MANAGED`**: the enum value for the WAF-managed certificate has been assumed to be `"WAF_MANAGED"` by convention. If the API rejects it, adjust the constant `SAAS_CERT_TYPE_WAF_MANAGED` at the top of the script (alternative candidates: `"AWS_MANAGED"`, `"AUTO"`, `"MANAGED"`).
 
@@ -183,3 +186,4 @@ Both scripts run `publishAndEnforce` **only once at the end of the loop**, not p
 | Enforce policy             | `enforcePolicy`                | `enforcePolicy` (unchanged)   |
 | AES + RSA-OAEP encryption  | same                           | same                          |
 | Name pre-flight            | —                              | `validateName(name, "Asset")` |
+| Host header rewrite        | n/a                            | `updateWebApplicationProxySetting` (`isSetHeader` + `setHeader=Host:<value>`) |
