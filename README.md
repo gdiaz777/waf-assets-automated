@@ -48,7 +48,7 @@ Deploys assets to the configured AppSecSaaS profile. For each asset in the YAML:
 - `wafProfiles()` — resolves the profile UUID from its name.
 - `getWafAssets(matchSearch)` — lists existing assets (replaces the old `getAssets`).
 - `validateName(name)` — name uniqueness pre-flight.
-- `newAssetByWizard(...)` — single creation function, parameterised with `ownCertificate: boolean`. Internally sends `saasCertificateType: "BYOC"` or `"WAF_MANAGED"`.
+- `newAssetByWizard(...)` — single creation function, parameterised with `ownCertificate: boolean`. Internally sends `saasCertificateType: "BYOC"` or `"CPManaged"`.
 - `setHostHeader(assetId, host)` — applies the optional Host header rewrite via `updateWebApplicationProxySetting` (only invoked when `host` is provided in the YAML).
 - `asyncPublishChanges()`, `enforcePolicy()`, `waitForTask(id)`, `publishAndEnforce()` — publish flow.
 - `discardChanges()` — rollback if publish fails.
@@ -108,12 +108,10 @@ assets:
 - `name` — unique asset name.
 - `domain` — one or more URLs separated by comma, each `https://...`.
 - `owncertificate`:
-  - `true` → BYOC mode (Bring Your Own Cert). The certificate must be uploaded later with the other script.
-  - `false` → WAF-managed certificate (auto-provisioned by Check Point).
+  - `true` → BYOC mode (Bring Your Own Cert). The certificate must be uploaded later with the other script. Sent as `saasCertificateType: "BYOC"`.
+  - `false` → Check Point–managed certificate (auto-provisioned). Sent as `saasCertificateType: "CPManaged"`.
 - `upstream` — backend URL the WAF forwards traffic to.
 - `host` *(optional)* — Host header value sent to the upstream. Useful when the upstream LB does virtual-host routing on a different hostname than the public domain (e.g. AWS ELB routing on the internal hostname). When set, the script applies it via `updateWebApplicationProxySetting` after the asset is created.
-
-> **About `WAF_MANAGED`**: the enum value for the WAF-managed certificate has been assumed to be `"WAF_MANAGED"` by convention. If the API rejects it, adjust the constant `SAAS_CERT_TYPE_WAF_MANAGED` at the top of the script (alternative candidates: `"AWS_MANAGED"`, `"AUTO"`, `"MANAGED"`).
 
 ### 3. `certificates.yaml`
 
