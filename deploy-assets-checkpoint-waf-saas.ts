@@ -3,7 +3,7 @@
 // ----------------------------------------------------------------------------
 // Deploys assets (web applications) to Check Point CloudGuard WAF SaaS /
 // Infinity Next from the assets.yaml file. Supports two certificate modes:
-// own certificate (BYOC) and WAF-managed certificate (WAF_MANAGED).
+// own certificate (BYOC) and Check Point–managed certificate (CPManaged).
 //
 // Optimization: publishAndEnforce — expensive because it triggers the
 // validation + propagation of the policy to the whole data plane — is
@@ -16,12 +16,13 @@ import { parse as parseYaml } from "jsr:@std/yaml";
 // The double slash "//graphql" is the actual URL the portal uses — not a typo.
 const WAF_GRAPHQL_URL = "https://cloudinfra-gw.portal.checkpoint.com/app/waf//graphql";
 
-// Mapping from the YAML "owncertificate" flag to the saasCertificateType enum
-// expected by the API. "BYOC" is confirmed via HAR. "WAF_MANAGED" is the
-// assumed value for the managed flow — if Check Point rejects it, capture a
-// HAR creating an asset with an AWS-managed cert and adjust the value here.
+// Mapping from the YAML "owncertificate" flag to the saasCertificateType
+// enum expected by the API. Both values verified against the live API:
+//   - "BYOC"      → Bring Your Own Certificate (uploaded later via the
+//                   upload-certificate-... script).
+//   - "CPManaged" → Check Point Managed certificate (auto-provisioned).
 const SAAS_CERT_TYPE_BYOC = "BYOC";
-const SAAS_CERT_TYPE_WAF_MANAGED = "WAF_MANAGED";
+const SAAS_CERT_TYPE_CP_MANAGED = "CPManaged";
 
 // Global process state. Filled in at the start of main() and reused by all
 // functions to avoid having to pass the same arguments around.
@@ -332,11 +333,11 @@ async function publishAndEnforce() {
 
 // Creates an asset (web application) via the wizard.
 //   - ownCertificate: true  → BYOC (the cert is uploaded later with upload-certificate-...)
-//   - ownCertificate: false → WAF_MANAGED (cert auto-provisioned by Check Point)
+//   - ownCertificate: false → CPManaged (cert auto-provisioned by Check Point)
 //
 // The difference between the two modes in the API is:
-//   - assetInput.deployCertificateManually: true (BYOC) | false (WAF_MANAGED)
-//   - profileInput.saasCertificateType:     "BYOC"      | "WAF_MANAGED"
+//   - assetInput.deployCertificateManually: true (BYOC) | false (CPManaged)
+//   - profileInput.saasCertificateType:     "BYOC"      | "CPManaged"
 async function newAssetByWizard(assetData: {
     name: string;
     domain: string[];
@@ -352,7 +353,7 @@ async function newAssetByWizard(assetData: {
         "Content-Type": "application/json",
     };
 
-    const saasCertificateType = assetData.ownCertificate ? SAAS_CERT_TYPE_BYOC : SAAS_CERT_TYPE_WAF_MANAGED;
+    const saasCertificateType = assetData.ownCertificate ? SAAS_CERT_TYPE_BYOC : SAAS_CERT_TYPE_CP_MANAGED;
 
     const body = {
         operationName: "newAssetByWizard",
@@ -387,7 +388,7 @@ async function newAssetByWizard(assetData: {
                 vendor: null,
                 isSelfManaged: false,
                 region: assetData.region,
-                saasCertificateType,                      // ← key driver of the BYOC vs WAF_MANAGED choice
+                saasCertificateType,                      // ← key driver of the BYOC vs CPManaged choice
             },
             zoneInput: {},
             // Source policy for the behaviour engine.
