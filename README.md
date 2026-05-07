@@ -1,3 +1,6 @@
+# Repo based on 
+https://github.com/mkol5222/waf-assets-automated/tree/main
+
 # WAF SaaS Deployment and Certificate Upload Scripts
 
 This repository contains three Deno/TypeScript scripts to automate the management of assets (web applications) and certificates in **Check Point CloudGuard WAF SaaS / Infinity Next**:
