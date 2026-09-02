@@ -65,19 +65,23 @@ async function wafLogin(url: string, clientId: string, accessKey: string) {
     return null;
 }
 
-// Resolves the profile UUID (PROFILE_PID) from its name.
-// Lists all profiles in the tenant and filters by exact name match against
-// the value configured in the YAML.
-async function wafProfiles() {
+// Resolves the profile UUID (PROFILE_PID) from its name, and — critically —
+// its real region. Lists all profiles in the tenant and filters by exact
+// name match against the value configured in the YAML. The region value in
+// assets.yaml is NOT trusted for the actual asset-creation call: it is only
+// used to pick which profile to target if there are several; the region
+// sent to newAssetByWizard always comes from this query (see main()), since
+// a mismatched region silently breaks CPManaged certificate validation.
+async function wafProfiles(): Promise<{ id: string; region: string } | null> {
     const token = wafSession?.data?.token;
     const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
     };
     const body = {
-        operationName: "ProfilesName",
-        variables: {},
-        query: "query ProfilesName($matchSearch: String, $filters: ProfileFilter, $paging: Paging, $sortBy: SortBy) {\n  getProfiles(\n    matchSearch: $matchSearch\n    filters: $filters\n    paging: $paging\n    sortBy: $sortBy\n  ) {\n    id\n    name\n    __typename\n  }\n}\n",
+        operationName: "ConfigProfiles",
+        variables: { filters: { profileType: ["AppSecSaaS"] } },
+        query: "query ConfigProfiles($matchSearch: String, $filters: ProfileFilter, $paging: Paging, $sortBy: SortBy) {\n  getProfiles(\n    matchSearch: $matchSearch\n    filters: $filters\n    paging: $paging\n    sortBy: $sortBy\n  ) {\n    id\n    name\n    profileType\n    ... on AppSecSaaSProfile {\n      region\n      __typename\n    }\n    __typename\n  }\n}\n",
     };
     try {
         const response = await fetch(WAF_GRAPHQL_URL, {
@@ -87,12 +91,12 @@ async function wafProfiles() {
         });
         if (response.ok) {
             const data = await response.json();
-            const profiles = data?.data?.getProfiles?.map((p: any) => ({ id: p.id, name: p.name })) ?? [];
+            const profiles = data?.data?.getProfiles?.map((p: any) => ({ id: p.id, name: p.name, region: p.region })) ?? [];
             console.log("Profiles fetched successfully:", profiles);
             const match = profiles.find((p: any) => p.name === PROFILE);
             if (match) {
-                console.log(`Matching profile found: ${match.name} with ID ${match.id}`);
-                return match.id;
+                console.log(`Matching profile found: ${match.name} with ID ${match.id}, region ${match.region}`);
+                return { id: match.id, region: match.region };
             }
             console.error(`No profile found with the name "${PROFILE}"`);
         } else {
@@ -233,19 +237,31 @@ async function enforcePolicy() {
 }
 
 // Polls the task status with a fixed 2s backoff. Exits when the status is no
-// longer InProgress (i.e. Succeeded, Failed, etc.).
+// longer InProgress (i.e. Succeeded, Failed, etc.). No attempt cap — a
+// PublishPolicy task that provisions a CPManaged certificate has been
+// observed to stay InProgress for several minutes; bailing out early is what
+// caused enforcePolicy to run against a not-yet-published draft.
 async function waitForTask(taskId: string) {
     console.log("Waiting for taskId:", taskId);
     while (true) {
         const task = await getTask(taskId);
         const status = task?.status;
-        console.log("Task status:", status);
-        if (status !== "InProgress") break;
+        console.log(`Task status: ${status} (type=${task?.type}, message=${task?.message ?? "-"})`);
+        if (status !== "InProgress") {
+            console.log("Task finished:", JSON.stringify(task));
+            return task;
+        }
         await new Promise((resolve) => setTimeout(resolve, 2000));
     }
 }
 
-// Reads the status of an async task by its id.
+// Reads the status of an async task by its id. Includes taskData.publishData
+// (validation errors/warnings) and taskData.certificateData — CPManaged
+// certificate issuance shows up here, and is what actually gates a
+// PublishPolicy task's completion. Confirmed against a HAR capture: a
+// PublishPolicy task for a CPManaged asset was still "InProgress" with a
+// fully-null certificateData several minutes in — issuance is genuinely
+// slow, not an artifact of polling too little.
 async function getTask(taskid: string) {
     const token = wafSession?.data?.token;
     const headers = {
@@ -253,8 +269,9 @@ async function getTask(taskid: string) {
         "Content-Type": "application/json",
     };
     const body = {
+        operationName: "Task",
         variables: { id: taskid },
-        query: "query getTask($id: ID!) {\n  getTask(id: $id) {\n    id\n    status\n    startTime\n  endTime\n   message\n    errorCode\n    referenceId\n    tenantId\n  }\n}\n",
+        query: "query Task($id: ID!) {\n  getTask(id: $id) {\n    id\n    type\n    status\n    message\n    taskData {\n      publishData {\n        isValid\n        errors {\n          message\n          __typename\n        }\n        warnings {\n          message\n          __typename\n        }\n        isNginxErrors\n        __typename\n      }\n      certificateData {\n        certificateId\n        status\n        issuedBy\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}\n",
     };
     const response = await fetch(WAF_GRAPHQL_URL, {
         method: "POST",
@@ -313,62 +330,36 @@ async function setHostHeader(assetId: string, hostHeader: string) {
     return null;
 }
 
-// Returns the list of sessions that have been published but not yet enforced.
-// Used to bridge between asyncPublishChanges (which returns immediately while
-// validation runs in the background) and enforcePolicy (which only takes
-// effect once a published session is sitting in this list).
-async function getUnenforcedPublishedSessions(): Promise<any[]> {
-    const token = wafSession?.data?.token;
-    const headers = {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-    };
-    const body = {
-        operationName: "getUnenforcedPublishedSessions",
-        variables: {},
-        query: "query getUnenforcedPublishedSessions {\n  getUnenforcedPublishedSessions {\n    id\n    __typename\n  }\n}\n",
-    };
-    const response = await fetch(WAF_GRAPHQL_URL, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-    });
-    if (response.ok) {
-        const data = await response.json();
-        return data?.data?.getUnenforcedPublishedSessions ?? [];
-    }
-    return [];
-}
-
-// Polls getUnenforcedPublishedSessions until at least one session is ready
-// to be enforced (or the timeout expires). Without this wait an enforce
-// fired right after asyncPublishChanges enforces the OLD state — leaving
-// fresh cert/asset changes in a "published but not enforced" limbo.
-async function waitForPublishedSession(maxAttempts = 30, intervalMs = 2000): Promise<boolean> {
-    for (let i = 0; i < maxAttempts; i++) {
-        const sessions = await getUnenforcedPublishedSessions();
-        if (sessions.length > 0) {
-            console.log(`Published session ready after ${i * intervalMs / 1000}s (${sessions.length} pending)`);
-            return true;
-        }
-        await new Promise((r) => setTimeout(r, intervalMs));
-    }
-    console.warn("waitForPublishedSession timed out — nothing to enforce, or publish never settled");
-    return false;
-}
-
-// Combines publish + wait-for-publish + enforce + wait-for-task.
+// Combines publish + wait-for-publish-task + enforce + wait-for-enforce-task.
 //
-// IMPORTANT: enforcePolicy is ALWAYS called, even if waitForPublishedSession
-// times out. Empirically, certificate / asset changes can sit in a "needs
-// enforce" state that getUnenforcedPublishedSessions does not surface, so
-// the wait is just a timing hint to give validation a chance — never a gate.
+// asyncPublishChanges returns a task id (type "PublishPolicy" when polled via
+// getTask) — that task is what actually validates the draft AND, for
+// CPManaged assets, provisions the certificate. It must be awaited for real
+// before enforcing, or enforcePolicy runs against the still-unpublished
+// state and the new/changed assets are left sitting as objectStatus "New"
+// forever (confirmed live: an asset created this way never showed up as
+// deployed, even though every mutation individually reported success).
+// A prior version of this function polled getUnenforcedPublishedSessions
+// with a 60s cap instead, which does not reflect this task's real progress
+// and enforced too early — do not reintroduce that shortcut. Certificate
+// issuance for a CPManaged asset can take several minutes (confirmed via a
+// HAR capture where the publish task was still InProgress after 30+ polls),
+// so this wait is intentionally uncapped.
 async function publishAndEnforce() {
     console.log("Publishing changes...");
-    const publish = await asyncPublishChanges();
-    console.log("Publish result:", publish);
+    const publishTaskId = await asyncPublishChanges();
+    console.log("Publish task id:", publishTaskId);
+    if (!publishTaskId) {
+        console.error("asyncPublishChanges did not return a task id");
+        return false;
+    }
 
-    await waitForPublishedSession();
+    const publishTask = await waitForTask(publishTaskId);
+    const publishData = publishTask?.taskData?.publishData;
+    if (publishData?.isValid === false) {
+        console.error("Publish is not valid:", publishData);
+        return false;
+    }
 
     console.log("Enforcing policy...");
     const enforce = await enforcePolicy();
@@ -384,9 +375,30 @@ async function publishAndEnforce() {
 //   - ownCertificate: true  → BYOC (the cert is uploaded later with upload-certificate-...)
 //   - ownCertificate: false → CPManaged (cert auto-provisioned by Check Point)
 //
-// The difference between the two modes in the API is:
-//   - assetInput.deployCertificateManually: true (BYOC) | false (CPManaged)
-//   - profileInput.saasCertificateType:     "BYOC"      | "CPManaged"
+// Payload verified against a HAR capture of the real portal wizard creating
+// a CPManaged asset (sistemafb.com.br, 2026-09-02), attached to the
+// existing "WAF SaaS Profile":
+//   - profileInput.region must be the profile's REAL region (resolved by
+//     wafProfiles()), not whatever assets.yaml says — a mismatch here is
+//     what silently broke CPManaged certificate validation.
+//   - profileInput also needs isWildcard: false, managedByNginx: false,
+//     profileManagedBy: null.
+//   - No AIGuard block in practiceInput, and APIProtection has exactly 3
+//     modes (no duplicate APIDiscovery entry).
+//
+// NOTE on assetInput.deployCertificateManually: the HAR captures showed
+// `true` even for a CPManaged asset, which looked like it superseded the
+// ownCertificate-based logic below — that was wrong. Confirmed live: setting
+// it unconditionally to true made a CPManaged (owncertificate: false) asset
+// come up in the portal as "My certificates" (BYOC, manual upload) instead
+// of "Certificates managed by Check Point". It IS tied to ownCertificate;
+// the HAR's `true` was just an artifact of that specific capture and is not
+// evidence it should be hardcoded.
+//
+// An earlier HAR capture (from a session where the portal's profile
+// selector was left empty) showed profileInput.id/name sent as "" — that
+// caused the portal to spin up a throwaway extra profile instead of
+// attaching to "WAF SaaS Profile", and is NOT what we want here.
 async function newAssetByWizard(assetData: {
     name: string;
     domain: string[];
@@ -426,18 +438,18 @@ async function newAssetByWizard(assetData: {
                 state: "Active",
                 upstreamURL: assetData.upstream,
             },
-            // Data of the profile the asset is attached to.
+            // Data of the profile the asset is attached to. region MUST be
+            // the profile's real region (see wafProfiles()) — a mismatched
+            // region here is what broke CPManaged certificate validation.
             profileInput: {
                 name: assetData.profileName,
                 id: assetData.profileId,
                 profileType: "AppSecSaaS",
-                onlyDefinedApplications: false,
-                // Fields used by non-SaaS profiles — null in SaaS:
-                certificateType: null,
-                vendor: null,
-                isSelfManaged: false,
                 region: assetData.region,
                 saasCertificateType,                      // ← key driver of the BYOC vs CPManaged choice
+                isWildcard: false,
+                managedByNginx: false,
+                profileManagedBy: null,
             },
             zoneInput: {},
             // Source policy for the behaviour engine.
@@ -459,19 +471,6 @@ async function newAssetByWizard(assetData: {
                         { mode: "Disabled", subPractice: "" },
                         { mode: "Disabled", subPractice: "APIDiscovery" },
                         { mode: "Disabled", subPractice: "SchemaValidation" },
-                        { mode: "Disabled", subPractice: "APIDiscovery" },
-                    ],
-                },
-                {
-                    // AIGuard is included disabled by default — the portal
-                    // sends it even when there is no LLM configuration, we
-                    // mirror that.
-                    practiceType: "AIGuard",
-                    modes: [
-                        { mode: "Disabled", subPractice: "" },
-                        { mode: "AccordingToPractice", subPractice: "PromptGuard" },
-                        { mode: "AccordingToPractice", subPractice: "DataGuard" },
-                        { mode: "AccordingToPractice", subPractice: "ContentGuard" },
                     ],
                 },
             ],
@@ -619,11 +618,16 @@ async function main() {
         return;
     }
 
-    PROFILE_PID = await wafProfiles();
-    if (!PROFILE_PID) {
+    const profile = await wafProfiles();
+    if (!profile) {
         console.error("Failed to get WAF profile ID");
         return;
     }
+    PROFILE_PID = profile.id;
+    // Override the YAML region with the profile's real region — required by
+    // newAssetByWizard for CPManaged certificate validation to succeed.
+    REGION = profile.region;
+    console.log("Using real profile region for asset creation:", REGION);
 
     if (!config?.assets) return;
 
